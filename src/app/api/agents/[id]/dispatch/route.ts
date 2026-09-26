@@ -6,6 +6,7 @@ import { abortRepairJob, createRepairJob, ensureMigrationWorkerJobs, findActiveR
 import { GITHUB_TOKEN_COOKIE, listGitHubWorkflowRuns } from "@/lib/github-oauth"
 import { syncGitHubWorkerSecrets } from "@/lib/github-worker-secrets"
 import { assertWorkerWorkflow } from "@/lib/github-worker-setup"
+import { syncWorkerRepository } from "@/lib/github-worker-sync"
 import { enrollMigrationWorkerAgents, getMigration, listMigrationItems } from "@/lib/migrations-store"
 import { getMigrationWorkerSettings } from "@/lib/migration-worker-settings-store"
 import { getMigrationOrchestratorSettings } from "@/lib/migration-orchestrator-settings-store"
@@ -252,7 +253,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         { status: 409 }
       )
     }
-    await assertWorkerWorkflow({ token: githubToken, owner: githubRepoOwner, repo: githubRepoName, ref: agent.githubRef || "main", workflow: githubWorkflowFile })
+    const codeSync = await syncWorkerRepository({ token: githubToken, owner: githubRepoOwner, repo: githubRepoName, workflow: githubWorkflowFile, sourceRepo: process.env.GITHUB_WORKER_SOURCE_REPO, activateActions: agent.status === "dispatch_ready" })
+    await assertWorkerWorkflow({ token: githubToken, owner: githubRepoOwner, repo: githubRepoName, ref: codeSync.targetSha, workflow: githubWorkflowFile })
+    await updateAgent(id, { githubRef: codeSync.defaultBranch })
     const dispatchRequestedAt = new Date().toISOString()
     const workerInstanceId = crypto.randomUUID()
     // Every dispatch carries a cryptographically unique instance id, so it can
@@ -301,7 +304,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
           repoOwner: githubRepoOwner,
           repoName: githubRepoName,
           workflowFile: githubWorkflowFile,
-          ref: agent.githubRef || "main",
+          ref: codeSync.defaultBranch,
+          sourceCommit: codeSync.sourceSha,
+          workerCommit: codeSync.targetSha,
           dispatchRequestedAt,
           githubRunIdsBeforeDispatch: Array.from(runIdsBeforeDispatch),
         },
@@ -340,6 +345,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
               agent_id: id,
               worker_instance_id: instanceId,
               workflow_file: githubWorkflowFile,
+              code_ref: codeSync.targetSha,
             },
           }),
         }

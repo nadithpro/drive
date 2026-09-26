@@ -1,3 +1,4 @@
+import { syncWorkerRepository } from "@/lib/github-worker-sync"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { createAgent, listAgents, type AgentCapability, type AgentCategory, type AgentProvider } from "@/lib/agents-store"
@@ -67,6 +68,8 @@ export async function POST(request: Request) {
     const githubTokenFromCookie = cookieStore.get(GITHUB_TOKEN_COOKIE)?.value ?? ""
     const githubTokenToUse = asString(body.githubToken).trim() || githubTokenFromCookie || undefined
 
+    let githubRef = asString(body.githubRef).trim() || undefined
+
     // A registered workflow is eligible for immediate orchestrator dispatch,
     // including while a migration is already running. Provision its runtime
     // contract before saving the row so the orchestrator can never discover
@@ -81,6 +84,15 @@ export async function POST(request: Request) {
       if (workerSettings.sharedSecret.length < 24 || workerSettings.sharedSecret.length > 512) {
         throw new Error("Configure the Migration Worker shared secret before adding a GitHub workflow")
       }
+      const codeSync = await syncWorkerRepository({
+        token: githubTokenToUse,
+        owner: asString(body.githubRepoOwner).trim(),
+        repo: asString(body.githubRepoName).trim(),
+        workflow: asString(body.githubWorkflowFile).trim(),
+        sourceRepo: process.env.GITHUB_WORKER_SOURCE_REPO,
+        activateActions: true,
+      })
+      githubRef = codeSync.defaultBranch
       await syncGitHubWorkerSecrets({
         token: githubTokenToUse,
         owner: asString(body.githubRepoOwner).trim(),
@@ -100,7 +112,7 @@ export async function POST(request: Request) {
       githubRepoOwner: asString(body.githubRepoOwner).trim() || undefined,
       githubRepoName: asString(body.githubRepoName).trim() || undefined,
       githubWorkflowFile: asString(body.githubWorkflowFile).trim() || undefined,
-      githubRef: asString(body.githubRef).trim() || undefined,
+      githubRef,
       githubRepositoryId: asString(body.githubRepositoryId).trim() || undefined,
       githubToken: githubTokenToUse,
       workerCount: provider === "github_actions" ? Number(body.workerCount) : 1,

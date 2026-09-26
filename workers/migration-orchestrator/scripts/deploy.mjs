@@ -26,5 +26,5 @@ function deployWithRetry(wrangler, args) {
 try {
   const wrangler = process.platform === "win32" ? "npx.cmd" : "npx"
   writeFileSync(secrets, JSON.stringify({ POSTGRES_URL: url.toString(), MIGRATION_ORCHESTRATOR_SECRET: sharedSecret }), { mode: 0o600 })
-  deployWithRetry(wrangler, ["wrangler", "deploy", "--secrets-file", secrets, "--keep-vars", "--var", `PANEL_URL:${panelUrl}`, "--var", `DISABLE_POSTGRES_SSL:${config.disablePostgresSsl === true ? "1" : "0"}`])
+  deployWithRetry(wrangler, ["wrangler", "deploy", "--secrets-file", secrets, "--keep-vars", "--var", `PANEL_URL:${panelUrl}`, "--var", `GITHUB_WORKER_SOURCE_REPO:${config.githubWorkerSourceRepo || "iamnadith/Drive"}`, "--var", `DISABLE_POSTGRES_SSL:${config.disablePostgresSsl === true ? "1" : "0"}`])
 } finally { rmSync(directory, { recursive: true, force: true }) }

@@ -22,5 +22,6 @@ export async function GET(request: Request) {
     version: 1,
     postgresUrl: database,
     disablePostgresSsl: postgresSslDisabled(database),
+    githubWorkerSourceRepo: process.env.GITHUB_WORKER_SOURCE_REPO?.trim() || "iamnadith/Drive",
   }, { headers: { "Cache-Control": "no-store, max-age=0" } })
 }

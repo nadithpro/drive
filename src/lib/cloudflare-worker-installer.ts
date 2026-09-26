@@ -351,6 +351,7 @@ async function uploadWorker(input: { worker: HostedWorker; token: string; accoun
     { type: "secret_text", name: worker === "backend" ? "BACKEND_ORCHESTRATOR_SECRET" : worker === "scanner" ? "FILE_SCANNER_SECRET" : "MIGRATION_ORCHESTRATOR_SECRET", text: state.secrets[worker] },
     { type: "plain_text", name: "PANEL_URL", text: publicPanelUrl },
     { type: "plain_text", name: "DISABLE_POSTGRES_SSL", text: disablePostgresSsl ? "1" : "0" },
+    { type: "plain_text", name: "GITHUB_WORKER_SOURCE_REPO", text: process.env.GITHUB_WORKER_SOURCE_REPO?.trim() || "iamnadith/Drive" },
   ]
   const names = resourceNames()
   if (worker === "scanner") bindings.push({ type: "queue", name: "FILE_SCAN_QUEUE", queue_name: names.scannerQueue })

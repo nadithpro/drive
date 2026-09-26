@@ -5,8 +5,6 @@ import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { WorkerRepository } from "@/lib/github-worker-setup"
 
-const STORAGE_KEY = "drive.github-worker-setup"
-
 export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
   connected: boolean
   onSelect: (repo: WorkerRepository, workflow: string) => void
@@ -18,16 +16,15 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
   const controller = React.useRef<AbortController | null>(null)
   const cursor = React.useRef<string | undefined>(undefined)
   React.useEffect(() => {
-    try { cursor.current = sessionStorage.getItem(STORAGE_KEY) || undefined } catch {}
     return () => { controller.current?.abort(); onBusy(false) }
   }, [onBusy])
 
-  async function run(selectedId?: string, restart = false) {
+  async function run(selectedId?: string) {
     if (controller.current) return
-    if (restart) {
-      cursor.current = undefined
-      try { sessionStorage.removeItem(STORAGE_KEY) } catch {}
-    }
+    // Every button click starts a complete discovery pass. Existing forks are
+    // reconciled by the server, so retries recover without stale saved sessions
+    // or creating duplicate repositories. A repository choice continues its scan.
+    if (!selectedId) cursor.current = undefined
     const abort = new AbortController()
     controller.current = abort
     setBusy(true)
@@ -56,20 +53,21 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
         setMessage(typeof result.message === "string" ? result.message : "Continuing GitHub setup...")
         if (typeof result.cursor === "string" && result.cursor) {
           cursor.current = result.cursor
-          try { sessionStorage.setItem(STORAGE_KEY, result.cursor) } catch {}
         }
         if (result.status === "ready" && result.repo && typeof result.workflow === "string" && result.workflow) {
           cursor.current = undefined
-          try { sessionStorage.removeItem(STORAGE_KEY) } catch {}
           onSelect(result.repo, result.workflow)
           return
         }
-        if (result.status === "ready") throw new Error("GitHub setup did not return a repository workflow. Start fresh and retry.")
+        if (result.status === "ready") throw new Error("GitHub setup did not return a repository workflow. Press start to retry.")
         if (result.status === "choose") {
           const nextCandidates = Array.isArray(result.candidates) ? result.candidates : []
-          if (nextCandidates.length === 0) throw new Error("GitHub setup returned no repository choices. Start fresh and retry.")
+          if (nextCandidates.length === 0) throw new Error("GitHub setup returned no repository choices. Press start to retry.")
           setCandidates(nextCandidates)
           return
+        }
+        if (result.status !== "pending" || typeof result.cursor !== "string" || !result.cursor) {
+          throw new Error("GitHub setup returned an incomplete response. Press start to retry.")
         }
         selectedId = undefined
         await new Promise<void>((resolve, reject) => {
@@ -78,9 +76,9 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
           abort.signal.addEventListener("abort", cancel, { once: true })
         })
       }
-      setMessage("Setup is taking longer than expected. Continue to resume, or update an older fork if its worker files are missing.")
+      setMessage("Setup is taking longer than expected. Press start to check the repository and finish setup.")
     } catch (error) {
-      if (!abort.signal.aborted) setMessage(error instanceof Error ? error.message : "Setup failed. Continue to retry.")
+      if (!abort.signal.aborted) setMessage(error instanceof Error ? error.message : "Setup failed. Press start to retry.")
     } finally {
       if (!abort.signal.aborted) { setBusy(false); onBusy(false) }
       controller.current = null
@@ -88,10 +86,9 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
   }
 
   return <div className="md:col-span-2 flex flex-col gap-3">
-    <p className="text-sm text-muted-foreground">Find an existing fork even if it was renamed. If none is found, create a fork in your connected GitHub account and enable its worker workflow.</p>
+    <p className="text-sm text-muted-foreground">Automatically find or create your worker repository, sync the latest code, and activate its workflow. Existing repositories are reused when you retry.</p>
     <div className="flex gap-2">
-      <Button type="button" disabled={!connected || busy} onClick={() => void run()}>{busy ? "Detecting..." : "Detect or continue setup"}</Button>
-      <Button type="button" variant="outline" disabled={!connected || busy} onClick={() => void run(undefined, true)}>Start fresh</Button>
+      <Button type="button" disabled={!connected || busy} aria-busy={busy} onClick={() => void run()}>{busy ? "Starting..." : "start"}</Button>
     </div>
     {message && <p role="status" className="text-sm text-muted-foreground">{message}</p>}
     {candidates.length > 0 && <Select disabled={busy} onValueChange={(id) => void run(id)}>

@@ -25,7 +25,8 @@ function loadOAuth() {
   return mod.exports
 }
 
-function loadSetup(api) {
+function loadSetup(api, syncPending = false) {
+  class WorkerSyncPendingError extends Error {}
   const filename = path.resolve('src/lib/github-worker-setup.ts')
   const mod = new Module(filename, module)
   mod.filename = filename
@@ -33,6 +34,7 @@ function loadSetup(api) {
   class GitHubApiError extends Error { constructor(message, status) { super(message); this.status = status } }
   mod.require = (name) => {
     if (name === './github-worker-workflow') return loadWorkflowContract()
+    if (name === './github-worker-sync') return { syncWorkerRepository: async () => { if (syncPending) throw new WorkerSyncPendingError('waiting for indexing'); return {} }, WorkerSyncPendingError }
     if (name === './github-oauth') return {
       githubApi: api,
       GitHubApiError,
@@ -55,15 +57,17 @@ function fixture(repos, options = {}) {
   let workflowListCalls = 0
   let setup
   const api = async (url, token, init) => {
-    calls.push({ url, method: init?.method || 'GET' })
+    calls.push({ url, method: init?.method || 'GET', body: init?.body ? JSON.parse(init.body) : undefined })
     if (options.fail && options.fail(url)) throw new setup.GitHubApiError('Rate limited', 403)
-    if (url === '/repos/iamnadith/Drive') return source
+    if (url === '/repos/iamnadith/Drive') return { ...source, ...options.source }
     if (url.startsWith('/user/repos?')) {
+      if (options.invalidPage) return { repositories: [] }
       const page = Number(new URL(`https://api.github.com${url}`).searchParams.get('page'))
       return repos.slice((page - 1) * 10, page * 10)
     }
-    if (url === '/user') return { login: 'me' }
-    if (url === '/repos/me/drive-worker-1' && options.existingFork) return options.existingFork
+    if (url === '/user') return { login: options.login || 'me' }
+    if (options.collisions?.[url]) return options.collisions[url]
+    if (url === '/repos/me/Drive' && options.existingFork) return options.existingFork
     if (options.missingFile && url.includes('/contents/migration')) throw new setup.GitHubApiError('Not ready', 404)
     if (url.endsWith('/forks')) return repo(500, { fork: true, source: { id: 1 } })
     if (url.includes('/contents/.drive-worker.json')) {
@@ -82,7 +86,7 @@ function fixture(repos, options = {}) {
     if (url === '/repos/me/renamed-500') return repo(500, { fork: true, source: { id: 1 } })
     throw new setup.GitHubApiError('Not found', 404)
   }
-  setup = loadSetup(api)
+  setup = loadSetup(api, options.syncPending)
   return { ...setup, calls }
 }
 test('detects a renamed marker repository beyond the first hundred among unrelated repositories', async () => {
@@ -106,11 +110,12 @@ test('does not guess between matching copies', async () => {
   assert.equal((await f.advanceWorkerSetup('token', choice.cursor, '10')).repo.id, '10')
   await assert.rejects(f.advanceWorkerSetup('token', choice.cursor, '99'), /detected matches/)
 })
-test('complete empty scan requests a deterministic fork then verifies readiness', async () => {
+test('complete empty scan forks with the original name then verifies readiness', async () => {
   const f = fixture([])
   const pending = await f.advanceWorkerSetup('token')
   assert.equal(pending.status, 'pending')
   assert.equal(f.calls.filter(c => c.method === 'POST').length, 1)
+  assert.equal(f.calls.find(c => c.method === 'POST').body.name, 'Drive')
   assert.equal((await f.advanceWorkerSetup('token', pending.cursor)).repo.id, '500')
 })
 test('auto detection forks instead of selecting the upstream template repository', async () => {
@@ -150,14 +155,12 @@ test('auto setup returns the actual compatible workflow path instead of a hardco
   assert.equal(result.status, 'ready')
   assert.equal(result.workflow, workflowPath)
 })
-test('fork setup waits when GitHub has not indexed its workflow yet', async () => {
+test('old fork with no indexed workflow bootstraps from the source workflow', async () => {
   const f = fixture([], { emptyWorkflowLists: 1 })
   const fork = await f.advanceWorkerSetup('token')
   assert.equal(fork.status, 'pending')
   const waiting = await f.advanceWorkerSetup('token', fork.cursor)
-  assert.equal(waiting.status, 'pending')
-  const ready = await f.advanceWorkerSetup('token', waiting.cursor)
-  assert.equal(ready.status, 'ready')
+  assert.equal(waiting.status, 'ready')
 })
 test('workflow listing excludes Actions records whose files no longer exist', async () => {
   const oauth = loadOAuth()
@@ -424,8 +427,11 @@ test('lost fork response is reconciled using the stable destination without anot
 })
 test('unrelated destination name collision is never overwritten', async () => {
   const f = fixture([], { existingFork: repo(500) })
-  await assert.rejects(f.advanceWorkerSetup('token'), /already exists and is unrelated/)
+  const collision = await f.advanceWorkerSetup('token')
+  assert.equal(collision.status, 'pending')
   assert.ok(!f.calls.some(c => c.method !== 'GET'))
+  await f.advanceWorkerSetup('token', collision.cursor)
+  assert.equal(f.calls.find(c => c.method === 'POST').body.name, 'Drive-1')
 })
 test('archived marker repository is not automatically selected or replaced', async () => {
   const f = fixture([repo(9, { archived: true })], { marked: [9] })
@@ -436,4 +442,68 @@ test('read-only upstream in the list does not prevent creating a personal fork',
   const f = fixture([{ ...source, permissions: { push: false, admin: false } }])
   assert.equal((await f.advanceWorkerSetup('token')).status, 'pending')
   assert.equal(f.calls.filter(c => c.method === 'POST').length, 1)
+})
+
+
+test('malformed repository pages never trigger a fork', async () => {
+  const f = fixture([], { invalidPage: true })
+  await assert.rejects(f.advanceWorkerSetup('token'), /incomplete repository page/)
+  assert.ok(!f.calls.some(c => c.method === 'POST'))
+})
+test('multiple occupied names advance numeric suffixes and reuse a related numbered fork', async () => {
+  const f = fixture([], { collisions: {
+    '/repos/me/Drive': repo(51),
+    '/repos/me/Drive-1': repo(52),
+    '/repos/me/Drive-2': repo(500, { fork: true, source: { id: 1 } }),
+  } })
+  let result = await f.advanceWorkerSetup('token')
+  while (result.status === 'pending') result = await f.advanceWorkerSetup('token', result.cursor)
+  assert.equal(result.repo.id, '500')
+  assert.ok(!f.calls.some(c => c.method === 'POST'))
+})
+test('original-name fork is detected by ancestry after a complete scan', async () => {
+  const f = fixture([repo(9, { name: 'Drive', full_name: 'me/Drive', fork: true, source: { id: 1 } })])
+  const result = await f.advanceWorkerSetup('token')
+  assert.equal(result.repo.fullName, 'me/Drive')
+  assert.ok(!f.calls.some(c => c.method === 'POST'))
+})
+for (const failure of ['timeout', 'validation', 'collision']) {
+  test(`fork ${failure} response is reconciled without inventing another name`, async () => {
+    let setup, posted = false
+    const names = []
+    setup = loadSetup(async (url, token, init) => {
+      if (url === '/repos/iamnadith/Drive') return source
+      if (url.startsWith('/user/repos?')) return []
+      if (url === '/user') return { login: 'me' }
+      if (url === '/repos/me/Drive') {
+        if (posted && failure !== 'validation') return repo(500, failure === 'timeout' ? { source: { id: 1 } } : {})
+        throw new setup.GitHubApiError('Not found', 404)
+      }
+      if (url.endsWith('/forks')) {
+        posted = true
+        names.push(JSON.parse(init.body).name)
+        if (failure === 'timeout') throw new Error('Connection timed out')
+        throw new setup.GitHubApiError('Validation failed', 422)
+      }
+      throw new Error('Unexpected request ' + url)
+    })
+    if (failure === 'validation') await assert.rejects(setup.advanceWorkerSetup('token'), /Validation failed/)
+    else assert.equal((await setup.advanceWorkerSetup('token')).status, 'pending')
+    assert.deepEqual(names, ['Drive'])
+  })
+}
+
+test('source owner reuses the original repository instead of attempting an impossible self-fork', async () => {
+  const f = fixture([source], { login: 'iamnadith', source: { permissions: { admin: true, push: true } } })
+  const pending = await f.advanceWorkerSetup('token')
+  assert.equal((await f.advanceWorkerSetup('token', pending.cursor)).repo.fullName, 'iamnadith/Drive')
+  assert.ok(!f.calls.some(c => c.method === 'POST'))
+})
+
+test('workflow indexing waits are bounded and preserve the existing fork', async () => {
+  const f = fixture([repo(9, { fork: true, source: { id: 1 } })], { syncPending: true })
+  let result = await f.advanceWorkerSetup('token')
+  for (let attempt = 1; attempt < 5; attempt++) result = await f.advanceWorkerSetup('token', result.cursor)
+  await assert.rejects(f.advanceWorkerSetup('token', result.cursor), /forked and its worker files are synchronized.*github.com\/me\/renamed-9\/actions/)
+  assert.ok(!f.calls.some(c => c.method === 'POST'))
 })

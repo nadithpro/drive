@@ -399,6 +399,7 @@ export async function updateAgent(
     metadata: Record<string, unknown>
     lastHeartbeatAt: string | null
     workerCount: number
+    githubRef: string
   }>
 ): Promise<DriveAgent> {
   const columns: Record<string, unknown> = { updated_at: new Date().toISOString() }
@@ -407,6 +408,7 @@ export async function updateAgent(
   if (updates.metadata !== undefined) columns.metadata = JSON.stringify(updates.metadata)
   if (updates.lastHeartbeatAt !== undefined) columns.last_heartbeat_at = updates.lastHeartbeatAt ?? null
   if (updates.workerCount !== undefined) columns.worker_count = Math.max(1, Math.min(5, Math.floor(updates.workerCount)))
+  if (updates.githubRef !== undefined) columns.github_ref = updates.githubRef
   const values: unknown[] = [id]
   const assignments = Object.entries(columns).map(([column, value], index) => {
     values.push(value)

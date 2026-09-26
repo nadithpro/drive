@@ -309,7 +309,7 @@ export async function listGitHubWorkflowRuns(input: {
   if (input.event) query.set("event", input.event)
 
   const response = await githubApi<{ workflow_runs?: GitHubWorkflowRun[] }>(
-    `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/actions/workflows/${encodeURIComponent(input.workflow)}/runs?${query.toString()}`,
+    `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/actions/workflows/${encodeURIComponent(input.workflow.split("/").pop()!)}/runs?${query.toString()}`,
     input.token
   )
   return (Array.isArray(response.workflow_runs) ? response.workflow_runs : []).map((run) => ({

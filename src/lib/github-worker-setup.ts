@@ -1,6 +1,7 @@
 import crypto from "node:crypto"
 import { githubApi, GitHubApiError, listGitHubWorkflows } from "./github-oauth"
 import { isWorkerWorkflow } from "./github-worker-workflow"
+import { syncWorkerRepository, WorkerSyncPendingError } from "./github-worker-sync"
 
 export { isWorkerWorkflow } from "./github-worker-workflow"
 
@@ -14,7 +15,7 @@ type Repo = {
 }
 type State = {
   expires: number; source: Repo; page: number; matches: Repo[]
-  phase: "scan" | "fork" | "ready"; selected?: Repo; scanned: number; forkRequested?: boolean
+  phase: "scan" | "fork" | "ready"; selected?: Repo; scanned: number; forkRequested?: boolean; forkSuffix?: number; workflowWaitStarted?: number; workflowWaitAttempts?: number
 }
 export type WorkerRepository = {
   id: string; owner: string; name: string; fullName: string; defaultBranch: string
@@ -125,6 +126,9 @@ export async function advanceWorkerSetup(token: string, cursor?: string, selecte
   if (state.phase === "scan") {
     if (state.page > 1000) throw new Error("Scan exceeded 10,000 repositories; narrow GitHub access and restart")
     const batch = await githubApi<Repo[]>(`/user/repos?per_page=10&sort=full_name&direction=asc&affiliation=owner,collaborator,organization_member&page=${state.page}`, token)
+    if (!Array.isArray(batch) || batch.length > 10 || batch.some(repo => !repo || !Number.isSafeInteger(repo.id) || !repo.name || !repo.full_name || !repo.owner?.login || !repo.default_branch)) {
+      throw new Error("GitHub returned an incomplete repository page; retry detection before creating a fork")
+    }
     // Ten details per request, in two bounded groups, keeps serverless calls short.
     for (let offset = 0; offset < batch.length; offset += 5) {
       const details = await Promise.all(batch.slice(offset, offset + 5).map(async (repo) => {
@@ -153,16 +157,32 @@ export async function advanceWorkerSetup(token: string, cursor?: string, selecte
   }
   if (state.phase === "fork") {
     const user = await githubApi<{ login: string }>("/user", token)
-    // Stable alternate name avoids unrelated repositories named Drive without overwriting them.
-    const name = `drive-worker-${state.source.id}`
-    let existing: Repo | undefined
-    try { existing = await githubApi<Repo>(`/repos/${encodeURIComponent(user.login)}/${name}`, token) }
-    catch (error) { if (!(error instanceof GitHubApiError) || error.status !== 404) throw error }
+    // GitHub cannot fork a personal repository into the same owner. If the
+    // connected account owns the source and has no other copy, reuse it.
+    if (user.login.toLowerCase() === state.source.owner.login.toLowerCase()) {
+      state.selected = state.source
+      state.phase = "ready"
+      return pending("Using the existing source repository in your GitHub account...")
+    }
+    // Try the original name first. Only a confirmed unrelated collision advances
+    // the suffix; timeouts/permission errors must never create another fork.
+    const suffix = state.forkSuffix || 0
+    const name = suffix ? `${state.source.name.slice(0, 90)}-${suffix}` : state.source.name
+    const destination = `/repos/${encodeURIComponent(user.login)}/${encodeURIComponent(name)}`
+    const related = (repo: Repo) => repo.id !== state.source.id && (
+      repo.source?.id === (state.source.source?.id || state.source.id) || repo.parent?.id === state.source.id
+    )
+    const lookup = async () => {
+      try { return await githubApi<Repo>(destination, token) }
+      catch (error) { if (error instanceof GitHubApiError && error.status === 404) return undefined; throw error }
+    }
+    const collision = () => {
+      state.forkSuffix = suffix + 1
+      return pending(`Repository ${user.login}/${name} is already used. Checking the next available name...`)
+    }
+    const existing = await lookup()
     if (existing) {
-      const network = state.source.source?.id || state.source.id
-      if (existing.source?.id !== network && existing.parent?.id !== state.source.id) {
-        throw new Error(`Repository ${user.login}/${name} already exists and is unrelated. Use manual selection or rename that repository.`)
-      }
+      if (!related(existing)) return collision()
       state.selected = compact(existing)
     } else {
       try {
@@ -171,13 +191,12 @@ export async function advanceWorkerSetup(token: string, cursor?: string, selecte
           body: JSON.stringify({ name, default_branch_only: true }),
         }))
       } catch (error) {
-        // A timed-out response may have created the fork. Reconcile by its
-        // stable name before allowing another create request.
-        if (!(error instanceof GitHubApiError) || error.status !== 422) throw error
-        const reconciled = await githubApi<Repo>(`/repos/${encodeURIComponent(user.login)}/${name}`, token)
-        const network = state.source.source?.id || state.source.id
-        if (reconciled.source?.id !== network && reconciled.parent?.id !== state.source.id) throw error
-        state.selected = compact(reconciled)
+        // Reconcile every uncertain response, including timeouts. A 422 alone
+        // does not prove a name collision (it can also mean missing permission).
+        const reconciled = await lookup()
+        if (reconciled && related(reconciled)) state.selected = compact(reconciled)
+        else if (reconciled && error instanceof GitHubApiError && error.status === 422) return collision()
+        else throw error
       }
     }
     state.forkRequested = true
@@ -204,19 +223,35 @@ export async function advanceWorkerSetup(token: string, cursor?: string, selecte
   }
   let workflow: WorkflowFile
   try {
-    workflow = await detectWorkerWorkflow(repo, token)
+    try { workflow = await detectWorkerWorkflow({ ...repo, workerWorkflowHint: state.selected.workerWorkflowHint }, token) }
+    catch (error) {
+      if (!(error instanceof WorkerWorkflowPendingError)) throw error
+      // An old fork may predate the worker files entirely. Bootstrap it from
+      // the actual source workflow rather than polling stale files forever.
+      workflow = await detectWorkerWorkflow(state.source, token)
+    }
+    await syncWorkerRepository({ token, owner: repo.owner.login, repo: repo.name, workflow: workflow.path, sourceRepo: state.source.full_name, activateActions: true })
+    workflow = await detectWorkerWorkflow({ ...repo, workerWorkflowHint: workflow.path }, token)
     for (const path of [`${workflow.path}`, `${WORKFLOW_DIRECTORY}/package.json`, `${WORKFLOW_DIRECTORY}/package-lock.json`, `${WORKFLOW_DIRECTORY}/migration-worker.mjs`]) {
       const file = await githubApi<{ type?: string; encoding?: string; content?: string }>(`${repoPath(repo)}/contents/${contentPath(path)}?ref=${encodeURIComponent(repo.default_branch)}`, token)
       if (file.type !== "file") throw new Error(`Worker file ${path} is missing or invalid. Update the repository and retry.`)
     }
     if (workflow.state === "disabled_fork") {
-      await githubApi(`${repoPath(repo)}/actions/workflows/${contentPath(workflow.path)}/enable`, token, { method: "PUT" })
+      await githubApi(`${repoPath(repo)}/actions/workflows/${encodeURIComponent(workflow.id)}/enable`, token, { method: "PUT" })
       return pending("Enabling the worker workflow...")
     }
     if (workflow.state !== "active") throw new Error(`Worker workflow ${workflow.path} is disabled. Enable it in GitHub Actions and retry.`)
   } catch (error) {
+    if (error instanceof WorkerSyncPendingError) {
+      state.workflowWaitStarted ??= Date.now()
+      state.workflowWaitAttempts = (state.workflowWaitAttempts || 0) + 1
+      if (state.workflowWaitAttempts >= 6 || Date.now() - state.workflowWaitStarted >= 90_000) {
+        throw new Error(`Repository ${repo.full_name} is forked and its worker files are synchronized, but GitHub Actions is not ready. Open https://github.com/${repo.full_name}/actions and complete any fork activation prompt, then continue setup. If Actions is already enabled, check the workflow validation errors and the connected token's Actions access.`)
+      }
+      return pending(error.message)
+    }
     if ((error instanceof GitHubApiError && (error.status === 404 || error.status === 409)) || error instanceof WorkerWorkflowPendingError) {
-      return pending("Waiting for worker files and workflow. If this persists, update the fork from upstream and retry.")
+      return pending("Waiting for GitHub to prepare the synchronized worker files and workflow...")
     }
     throw error
   }
