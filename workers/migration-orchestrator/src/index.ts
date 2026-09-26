@@ -4,7 +4,7 @@ import { syncWorkerRepository } from "../../../src/lib/github-worker-sync"
 type DispatchMessage = { intentId: string } | { control: "cycle" }
 type Env = { POSTGRES_URL?: string; MIGRATION_ORCHESTRATOR_SECRET?: string; PANEL_URL?: string; DISABLE_POSTGRES_SSL?: string; GITHUB_WORKER_SOURCE_REPO?: string; GITHUB_DISPATCH_QUEUE: Queue<DispatchMessage> }
 type Row = Record<string, any>
-const BUILD = 35
+const BUILD = 36
 const MIN_QUEUE_BATCH_SIZE = 500
 const DEFAULT_QUEUE_BATCH_SIZE = 2_000
 const MAX_QUEUE_BATCH_SIZE = 4_000
@@ -771,37 +771,38 @@ async function recordItemStageEvents(db: Client, migration: Row, generation: num
   `, [migration.id])
 }
 async function ensureBucketVerification(db: Client, migration: Row, generation: number) {
-  // A migration has a strict global phase order: finish every bucket's scan
-  // and queue materialization, finish every transfer job, then verify.
+  // Each bucket may verify after its own inventory and transfers finish.
+  // Other buckets can keep copying; overall completion still waits for all.
   await db.query("begin")
   try {
     const ready = await db.query(`
-      select not exists(select 1 from drive_migration_items i where i.migration_id=$1
-          and (coalesce(i.progress->'migrationInventory'->>'status','')<>'completed'
-            or coalesce(i.progress->'migrationQueue'->>'status','')<>'completed'))
-        and not exists(select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $2 and j.status<>'completed') ready
+      select i.id,coalesce(i.progress->'migrationInventory'->>'status','')='completed'
+        and coalesce(i.progress->'migrationQueue'->>'status','')='completed'
+        and not exists(select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $2
+          and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed') ready
+      from drive_migration_items i where i.migration_id=$1
     `, [migration.id, `migration:${migration.id}:generation:${generation}:inventory:%`])
-    if (ready.rows[0]?.ready !== true) {
-      const stale = await db.query(`select 1 from drive_migration_verification_state where migration_id=$1 and generation=$2 and (status not in('pending','blocked') or phase<>'source' or source_objects<>0 or destination_objects<>0 or missing_objects<>0 or mismatched_objects<>0 or extra_objects<>0) limit 1`, [migration.id, generation])
+    const readyIds = ready.rows.filter((row) => row.ready === true).map((row) => row.id)
+    const blockedIds = ready.rows.filter((row) => row.ready !== true).map((row) => row.id)
+    if (blockedIds.length > 0) {
+      const stale = await db.query(`select 1 from drive_migration_verification_state where migration_id=$1 and generation=$2 and migration_item_id=any($3::uuid[]) and (status not in('pending','blocked') or phase<>'source' or source_objects<>0 or destination_objects<>0 or missing_objects<>0 or mismatched_objects<>0 or extra_objects<>0) limit 1`, [migration.id, generation, blockedIds])
       if (stale.rowCount) {
-        await db.query(`update drive_migration_verification_state set status='blocked',lease_owner=null,lease_expires_at=null,updated_at=now() where migration_id=$1 and generation=$2`, [migration.id, generation])
-        await db.query(`delete from drive_bucket_verify_diffs d using drive_migration_verification_state v where d.migration_item_id=v.migration_item_id and v.migration_id=$1 and v.generation=$2`, [migration.id, generation])
-        await db.query(`delete from drive_bucket_scan_objects o using drive_migration_verification_state v,drive_migration_items i where i.id=v.migration_item_id and o.scan_id in(v.source_scan_id,v.destination_scan_id) and o.scan_id is distinct from nullif(i.progress->'migrationInventory'->>'sourceScanId','')::uuid and v.migration_id=$1 and v.generation=$2`, [migration.id, generation])
-        await db.query(`update drive_bucket_scans s set status='completed',lease_owner=null,lease_expires_at=null,completed_at=coalesce(completed_at,now()),updated_at=now() from drive_migration_verification_state v join drive_migration_items i on i.id=v.migration_item_id where s.id in(v.source_scan_id,v.destination_scan_id) and s.id is distinct from nullif(i.progress->'migrationInventory'->>'sourceScanId','')::uuid and v.migration_id=$1 and v.generation=$2`, [migration.id, generation])
-        await db.query(`update drive_migration_verification_state set status='blocked',phase='source',source_scan_id=null,destination_scan_id=null,source_cursor=null,destination_cursor=null,source_objects=0,source_bytes=0,destination_objects=0,destination_bytes=0,missing_objects=0,mismatched_objects=0,extra_objects=0,lease_owner=null,lease_expires_at=null,completed_at=null,attempt_count=0,last_error=null,updated_at=now() where migration_id=$1 and generation=$2`, [migration.id, generation])
+        await db.query(`update drive_migration_verification_state set status='blocked',lease_owner=null,lease_expires_at=null,updated_at=now() where migration_id=$1 and generation=$2 and migration_item_id=any($3::uuid[])`, [migration.id, generation, blockedIds])
+        await db.query(`delete from drive_bucket_verify_diffs d using drive_migration_verification_state v where d.migration_item_id=v.migration_item_id and v.migration_id=$1 and v.generation=$2 and v.migration_item_id=any($3::uuid[])`, [migration.id, generation, blockedIds])
+        await db.query(`delete from drive_bucket_scan_objects o using drive_migration_verification_state v,drive_migration_items i where i.id=v.migration_item_id and o.scan_id in(v.source_scan_id,v.destination_scan_id) and o.scan_id is distinct from nullif(i.progress->'migrationInventory'->>'sourceScanId','')::uuid and v.migration_id=$1 and v.generation=$2 and v.migration_item_id=any($3::uuid[])`, [migration.id, generation, blockedIds])
+        await db.query(`update drive_bucket_scans s set status='completed',lease_owner=null,lease_expires_at=null,completed_at=coalesce(completed_at,now()),updated_at=now() from drive_migration_verification_state v join drive_migration_items i on i.id=v.migration_item_id where s.id in(v.source_scan_id,v.destination_scan_id) and s.id is distinct from nullif(i.progress->'migrationInventory'->>'sourceScanId','')::uuid and v.migration_id=$1 and v.generation=$2 and v.migration_item_id=any($3::uuid[])`, [migration.id, generation, blockedIds])
+        await db.query(`update drive_migration_verification_state set status='blocked',phase='source',source_scan_id=null,destination_scan_id=null,source_cursor=null,destination_cursor=null,source_objects=0,source_bytes=0,destination_objects=0,destination_bytes=0,missing_objects=0,mismatched_objects=0,extra_objects=0,lease_owner=null,lease_expires_at=null,completed_at=null,attempt_count=0,last_error=null,updated_at=now() where migration_id=$1 and generation=$2 and migration_item_id=any($3::uuid[])`, [migration.id, generation, blockedIds])
       }
-      await db.query("commit")
-      return
     }
-    await db.query(`update drive_migration_verification_state set status='pending',updated_at=now() where migration_id=$1 and generation=$2 and status='blocked'`, [migration.id, generation])
+    await db.query(`update drive_migration_verification_state set status='pending',updated_at=now() where migration_id=$1 and generation=$2 and status='blocked' and migration_item_id=any($3::uuid[])`, [migration.id, generation, readyIds])
     await db.query(`
     insert into drive_migration_verification_state(migration_item_id,migration_id,generation,source_scan_id,status,phase)
     select i.id,i.migration_id,$2,null,'pending','source'
     from drive_migration_items i
     where i.migration_id=$1
       and i.progress->'migrationQueue'->>'status'='completed'
-      and not exists (select 1 from drive_migration_items scan_item where scan_item.migration_id=$1 and (coalesce(scan_item.progress->'migrationInventory'->>'status','')<>'completed' or coalesce(scan_item.progress->'migrationQueue'->>'status','')<>'completed'))
-      and not exists (select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $3 and j.status<>'completed')
+      and i.progress->'migrationInventory'->>'status'='completed'
+      and not exists (select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $3 and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed')
       and not exists (select 1 from drive_migration_verification_state v where v.migration_item_id=i.id and v.generation=$2)
     on conflict (migration_item_id) do update set
       migration_id=excluded.migration_id,generation=excluded.generation,source_scan_id=excluded.source_scan_id,
@@ -1267,6 +1268,35 @@ async function releaseWorkerInstanceClaims(db: Client, agentId: string, instance
   `, [agentId, instanceId, reason.slice(0, 2000)])
   return released.rowCount || 0
 }
+let endpointHealth: { url: string; expiresAt: number; error: string | null } | null = null
+async function workerEndpointAvailable(db: Client, migrationId: string, orchestration: Row) {
+  const url = String(orchestration.orchestratorUrl || "").replace(/\/+$/, "")
+  if (!endpointHealth || endpointHealth.url !== url || endpointHealth.expiresAt <= Date.now()) {
+    let error: string | null = null
+    try {
+      const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(10_000) })
+      const body = await response.text()
+      if (!response.ok) error = response.status === 429 && /1027|reached their plan limits/i.test(body)
+        ? "Cloudflare Workers daily request limit reached (Error 1027). Worker dispatch is paused until the endpoint recovers."
+        : `Worker endpoint unavailable (HTTP ${response.status}). Worker dispatch is paused until it recovers.`
+      else {
+        const health = JSON.parse(body)
+        if (health?.ok !== true || health.service !== "migration-orchestrator") error = "Worker endpoint returned an unexpected health response. Worker dispatch is paused."
+      }
+    } catch { error = "Worker endpoint is unreachable. Worker dispatch is paused until it recovers." }
+    endpointHealth = { url, expiresAt: Date.now() + 60_000, error }
+  }
+  if (endpointHealth.error) {
+    await db.query(`update drive_migrations set sync_status='error',sync_message=$2,updated_at=now()
+      where id=$1 and status in('running','verifying') and sync_message is distinct from $2`, [migrationId, endpointHealth.error])
+    return false
+  }
+  await db.query(`update drive_migrations set sync_status='running',sync_message=null,
+    options=jsonb_set(coalesce(options,'{}'::jsonb),'{workerEndpointRecoveryUntil}',to_jsonb(now()+interval '6 minutes')),updated_at=now()
+    where id=$1 and status in('running','verifying') and (sync_message like 'Cloudflare Workers daily request limit reached%' or sync_message like 'Worker endpoint %')`, [migrationId])
+  return true
+}
+
 async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   const generation = integer(opts(migration).workerGeneration, 1, 1, 1000000)
   const stopped = await db.query(`
@@ -1280,6 +1310,13 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   const orchestration = configRows.rows.find((row) => row.key === "migration-orchestrator")?.value || {}
   const workerSettings = configRows.rows.find((row) => row.key === "migration-workers")?.value || {}
   if (!(await githubWorkerSecretsAreCurrent(orchestration, workerSettings))) return 0
+  // Missing heartbeats during an endpoint outage do not mean the GitHub
+  // processes need replacing. Keep their slots and durable file checkpoints.
+  if (!(await workerEndpointAvailable(db, migration.id, orchestration))) return 0
+  // Persist the grace across queue invocations: a worker may still be in its
+  // five-minute quota cooldown when the public endpoint first recovers.
+  const recovery = await db.query(`select options->>'workerEndpointRecoveryUntil' recovery_until from drive_migrations where id=$1`, [migration.id])
+  const endpointRecoveryGrace = Date.parse(String(recovery.rows[0]?.recovery_until || "")) > Date.now()
   const budget = integer(orchestration.maxDispatchesPerCycle, 100, 1, 100)
   const stranded = await db.query(`select id from drive_agent_runs where run_type='github_dispatch' and status='pending' and payload->>'migrationId'=$1 and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$2 and coalesce(payload->>'phase','created') in('created','queued') order by created_at limit $3`, [migration.id, generation, budget])
   for (const row of stranded.rows) await env.GITHUB_DISPATCH_QUEUE.send({ intentId: row.id }, { contentType: "json" })
@@ -1298,7 +1335,10 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
       try {
         const url = `https://api.github.com/repos/${encodeURIComponent(agent.github_repo_owner)}/${encodeURIComponent(agent.github_repo_name)}/actions/workflows/${encodeURIComponent(String(agent.github_workflow_file).split("/").pop()!)}/runs?event=repository_dispatch&branch=${encodeURIComponent(agent.github_ref || "main")}&per_page=100`
         const response = await fetch(url, { headers: { Authorization: `Bearer ${agent.github_token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Drive-Migration-Orchestrator" }, signal: AbortSignal.timeout(15_000) })
-        if (!response.ok) throw new Error(`GitHub workflow capacity check HTTP ${response.status}`)
+        if (!response.ok) {
+          const failure = await response.json().catch(() => ({})) as Row
+          throw new Error(`GitHub workflow capacity check HTTP ${response.status}${typeof failure.message === "string" ? `: ${failure.message.slice(0, 250)}` : ""}`)
+        }
         const payload = await response.json() as { workflow_runs?: Row[] }
         if (!Array.isArray(payload.workflow_runs)) throw new Error("GitHub returned an incomplete workflow run list")
         githubRunsByWorkflow.set(workflowKey, payload.workflow_runs)
@@ -1377,6 +1417,10 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
       }
       const heartbeatStale = Date.parse(String(tracked.updated_at || "")) < Date.now() - 3 * 60_000
       if (!heartbeatStale) {
+        agentOccupancy += 1
+        continue
+      }
+      if (endpointRecoveryGrace) {
         agentOccupancy += 1
         continue
       }
@@ -1588,6 +1632,7 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
     const result = await db.query(`select r.*,a.github_repo_owner,a.github_repo_name,a.github_workflow_file,a.github_ref,a.github_token,a.status agent_status from drive_agent_runs r join drive_agents a on a.id=r.agent_id where r.id=$1 for update of r`, [intentId])
     const intent = result.rows[0]
     if (!intent || intent.external_run_id || ["completed", "failed", "canceled"].includes(intent.status)) { await db.query("commit"); transactionOpen = false; return "terminal" }
+    let endpointConfiguration: Row | null = null
     if (intent.payload?.pool === true) {
       const current = await db.query(`select m.status,greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1)) generation,
         exists(select 1 from drive_repair_jobs j where j.migration_id=m.id and j.mode='migration' and j.status='canceled'
@@ -1602,6 +1647,7 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
       }
       const configuration = await db.query(`select key,value from drive_app_settings where key in('migration-orchestrator','migration-workers')`)
       const orchestration = configuration.rows.find((row) => row.key === "migration-orchestrator")?.value || {}
+      endpointConfiguration = orchestration
       const workerSettings = configuration.rows.find((row) => row.key === "migration-workers")?.value || {}
       if (!(await githubWorkerSecretsAreCurrent(orchestration, workerSettings))) {
         await db.query("commit"); transactionOpen = false
@@ -1613,6 +1659,11 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
     const phase = String(intent.payload?.phase || "created")
     const dispatchStartedAt = Date.parse(String(intent.payload?.dispatchStartedAt || ""))
     if (phase === "accepted" || (phase === "dispatching" && Number.isFinite(dispatchStartedAt) && Date.now() - dispatchStartedAt < 5 * 60_000)) { await db.query("commit"); transactionOpen = false; return "awaiting_reconciliation" }
+    if (endpointConfiguration && !(await workerEndpointAvailable(db, String(intent.payload.migrationId), endpointConfiguration))) {
+      await db.query(`update drive_agent_runs set status='failed',summary='Worker endpoint unavailable; dispatch deferred until recovery',completed_at=now(),updated_at=now() where id=$1 and status='pending'`, [intent.id])
+      await db.query("commit"); transactionOpen = false
+      return "terminal"
+    }
     const workerInstanceId = String(intent.payload.workerInstanceId)
     const codeSync = await syncWorkerRepository({ token: intent.github_token, owner: intent.github_repo_owner, repo: intent.github_repo_name, workflow: intent.github_workflow_file || ".github/workflows/migration-worker.yml", sourceRepo: env.GITHUB_WORKER_SOURCE_REPO, activateActions: intent.agent_status === "dispatch_ready" })
     await db.query(`update drive_agents set github_ref=$2,updated_at=now() where id=$1`, [intent.agent_id, codeSync.defaultBranch])

@@ -55,6 +55,7 @@ import {
   readVerifyState,
 } from "@/lib/migration-bucket-state"
 import { cn } from "@/lib/utils"
+import { migrationProgressPercent } from "@/lib/migration-progress"
 import { getMigrationReadOnlyState } from "@/lib/migration-read-only"
 
 type Account = {
@@ -986,17 +987,9 @@ export default function MigrationDetailsPage() {
       totalObjects > 0 ? Math.max(0, totalObjects - Math.min(totalObjects, resolvedTransferred + resolvedSkipped)) : 0
     const resolvedCopyFailed = totalObjects > 0 ? Math.min(copyFailed, remainingAfterTransferSkip) : copyFailed
     const done = resolvedTransferred + resolvedSkipped + resolvedCopyFailed
-    const allBucketsCompleted =
-      items.length > 0 &&
-      items.every((item) => isCompletedStatus(getBucketSnapshot(item).displayStatus))
     const residualUnaccounted = totalObjects > 0 ? Math.max(0, totalObjects - Math.min(totalObjects, done)) : rawUnaccounted
     const unaccounted = totalObjects > 0 ? Math.min(rawUnaccounted, residualUnaccounted) : rawUnaccounted
-    const percent =
-      allBucketsCompleted || (migration?.status === "completed" && migration.options?.manualCompleted === true)
-        ? 100
-        : totalObjects > 0
-          ? Math.max(0, Math.min(100, (done / totalObjects) * 100))
-          : 0
+    const percent = migrationProgressPercent(resolvedTransferred + resolvedSkipped, totalObjects)
     const transferredPct = totalObjects > 0 ? Math.max(0, Math.min(100, (resolvedTransferred / totalObjects) * 100)) : 0
     const skippedPct = totalObjects > 0 ? Math.max(0, Math.min(100, (resolvedSkipped / totalObjects) * 100)) : 0
     const copyFailedPct = totalObjects > 0 ? Math.max(0, Math.min(100, (resolvedCopyFailed / totalObjects) * 100)) : 0
@@ -1015,7 +1008,7 @@ export default function MigrationDetailsPage() {
       unaccountedPct,
       totalBytes,
     }
-  }, [getBucketSnapshot, items, migration?.options?.manualCompleted, migration?.status])
+  }, [getBucketSnapshot, items])
 
   const overviewProgress = totals
   const hasActiveSuperSlurper = React.useMemo(
@@ -1669,6 +1662,12 @@ export default function MigrationDetailsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {migration.syncStatus === "error" && migration.syncMessage ? (
+            <div role="alert" className="flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <span>{migration.syncMessage}</span>
+            </div>
+          ) : null}
           <dl className="grid gap-y-4 border-y py-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="flex min-w-0 items-start gap-3 sm:px-3 lg:border-r lg:first:pl-0">
               <CalendarDays className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1728,7 +1727,7 @@ export default function MigrationDetailsPage() {
                 <div className="flex items-center gap-3">
                   {overviewProgress.transferred > 0 ? (
                     <span>
-                      {formatNumber(overviewProgress.transferred)} transferred ({overviewProgress.transferredPct.toFixed(1)}%)
+                      {formatNumber(overviewProgress.transferred)} transferred ({(Math.floor(overviewProgress.transferredPct * 10) / 10).toFixed(1)}%)
                     </span>
                   ) : null}
                   {overviewProgress.skipped > 0 ? (
@@ -1940,30 +1939,14 @@ export default function MigrationDetailsPage() {
                           : "queued"
               const queueRemaining = items.reduce((sum, item) => sum + getBucketSnapshot(item).queued, 0)
               const lastActivityAt = latestRun?.lastHeartbeatAt || latestRun?.updatedAt || migration.updatedAt
-              const statusMessage = migrationStatus === "completed"
-                ? "Migration and worker processing completed."
-                : status === "aborting"
-                  ? "Waiting for active GitHub Actions runs to stop."
-                  : migrationStatus === "failed" || migrationStatus === "verification_failed"
-                    ? "Worker processing ended with an issue."
-                    : ["canceled", "cancelled", "aborted"].includes(migrationStatus)
-                      ? "Worker processing was stopped."
-                      : migrationStatus === "verifying"
-                        ? "Transfers finished and destination verification is running."
-                        : runningRuns.length > 0
-                          ? `${activeRuns.length} of ${runningRuns.length} worker${runningRuns.length === 1 ? "" : "s"} online.`
-                          : status === "deploying"
-                            ? "GitHub Actions workers are being dispatched."
-                            : "Waiting for workers to claim queued files."
 
               return (
                 <Card>
                   <CardHeader>
                     <CardTitle className="flex items-center justify-between gap-3">
-                      <span>Worker pool</span>
+                      <span>Worker Pool</span>
                       {migrationWorkerBadge(status)}
                     </CardTitle>
-                    <CardDescription>{statusMessage}</CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4">
                     <dl className="grid gap-y-4 border-y py-4 sm:grid-cols-2 lg:grid-cols-4">

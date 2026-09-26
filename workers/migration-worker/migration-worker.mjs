@@ -36,10 +36,11 @@ const WORKER_INSTANCE_ID = String(process.env.WORKER_INSTANCE_ID || GITHUB_RUN_I
 const DEFAULT_MAX_RUNTIME_SECONDS = process.env.GITHUB_ACTIONS === "true" ? "21300" : "0"
 const MAX_RUNTIME_SECONDS = Math.max(0, Number(getArg("max-runtime-seconds", DEFAULT_MAX_RUNTIME_SECONDS)) || 0)
 const RUNTIME_DEADLINE = MAX_RUNTIME_SECONDS > 0 ? Date.now() + MAX_RUNTIME_SECONDS * 1000 : Number.POSITIVE_INFINITY
-// Persistent workers immediately claim again after every completed file. When
-// the scanner is still producing inventory pages, a one-second idle poll
-// bounds hand-off latency without letting large worker pools hammer Postgres.
-const POLL_MS = Math.max(500, Number(getArg("poll-ms", "1000")) || 1_000)
+// Completed files immediately hand off to the next claim. Idle workers back
+// off instead of spending the account's request allowance every second.
+const POLL_MS = Math.max(5_000, Number(getArg("poll-ms", "10000")) || 10_000)
+let idleClaimCount = 0
+let apiBlockedUntil = 0
 const HEARTBEAT_MS = Math.max(10_000, Number(getArg("heartbeat-ms", "20000")) || 20_000)
 const LIVE_PROGRESS_SYNC_MS = Math.max(5_000, Number(getArg("live-progress-sync-ms", "10000")) || 10_000)
 const TELEMETRY_LOG_LIMIT = 100
@@ -324,6 +325,7 @@ async function api(path, body, options = {}) {
   return withRetries(
     `api ${path}`,
     async () => {
+      while (Date.now() < apiBlockedUntil) await sleep(Math.min(30_000, apiBlockedUntil - Date.now()))
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), timeoutMs)
       try {
@@ -333,12 +335,29 @@ async function api(path, body, options = {}) {
           body: JSON.stringify(body),
           signal: controller.signal,
         })
-        const json = await response.json().catch(() => ({}))
+        const responseText = await response.text()
+        let json = {}
+        try { json = JSON.parse(responseText) } catch { /* Provider errors can be HTML. */ }
         if (!response.ok) {
-          const message = typeof json.error === "string" ? json.error : `Request failed: ${response.status}`
+          const quotaExceeded = response.status === 429 && /(?:Error\s*1027|error-code[^>]*>\s*1027|reached their plan limits)/i.test(responseText)
+          if (response.status === 429 || response.status >= 500) {
+            const retryAfter = response.headers.get("retry-after")
+            const retryAfterMs = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : retryAfter ? Date.parse(retryAfter) - Date.now() : 0
+            // Share the cooldown across claims, heartbeats and progress updates.
+            apiBlockedUntil = Math.max(apiBlockedUntil, Date.now() + Math.max(quotaExceeded ? 300_000 : 30_000, Number.isFinite(retryAfterMs) ? retryAfterMs : 0))
+          }
+          const message = quotaExceeded
+            ? "Cloudflare Workers daily request limit reached (Error 1027); requests paused for five minutes"
+            : typeof json?.error === "string" ? json.error : `Request failed: ${response.status}`
           if (response.status === 401 || response.status === 403) throw new WorkerAuthenticationError(`Migration Orchestrator rejected the worker identity/secret (HTTP ${response.status})`)
           const requestError = new Error(message)
           requestError.status = response.status
+          throw requestError
+        }
+        if (!json || typeof json !== "object" || Array.isArray(json) || json.ok !== true) {
+          apiBlockedUntil = Math.max(apiBlockedUntil, Date.now() + 30_000)
+          const requestError = new Error("Migration Orchestrator returned an invalid API response")
+          requestError.status = 502
           throw requestError
         }
         return json
@@ -2052,10 +2071,12 @@ async function main() {
         return
       }
       if (!claimed?.job || !claimed?.payload) {
-        await sleep(POLL_MS)
+        idleClaimCount += 1
+        await sleep(Math.min(60_000, POLL_MS * 2 ** Math.min(idleClaimCount - 1, 3)) + Math.floor(Math.random() * 1_000))
         continue
       }
 
+      idleClaimCount = 0
       currentJobId = claimed.job.id
       jobAbortControllers.set(claimed.job.id, new AbortController())
       console.log(`Claimed job ${claimed.job.id} for migration ${claimed.payload?.migration?.id || "-"}`)

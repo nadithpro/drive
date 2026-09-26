@@ -10,7 +10,7 @@ type Env = { POSTGRES_URL?: string; FILE_SCANNER_SECRET?: string; PANEL_URL?: st
 type Row = Record<string, any>
 type ClaimedTask = { kind: "migration" | "generic"; task: Row }
 type ClaimedCycle = { ok: true; owner: string; tasks: ClaimedTask[] } | { ok: true; skipped: string } | { ok: true; idle: true }
-const BUILD = 20
+const BUILD = 21
 const MAX_SECRET_LENGTH = 512
 // Workers Free allows only 10 ms of CPU per invocation. Keep each invocation
 // deliberately small; queue continuations immediately schedule the next
@@ -142,16 +142,15 @@ async function claim(db: Client, owner: string): Promise<Row | null> {
         join drive_migration_items i on i.id=v.migration_item_id
         join drive_accounts sa on sa.id=m.source_account_id join drive_accounts ta on ta.id=m.target_account_id
         left join drive_bucket_settings_snapshots target_settings on target_settings.account_id=m.target_account_id and target_settings.bucket_name=i.target_bucket
-      -- Worker-pool migrations have a global phase barrier: no verification
-      -- may start until every source inventory and queue is complete and all
-      -- jobs for the active generation succeeded.
+      -- Verify a bucket only after its own inventory and transfer jobs finish.
+      -- Unfinished transfers in other buckets do not block this bucket.
       where m.status in('running','verifying')
         and (m.options->>'executionMode' is distinct from 'migration_workers' or (
-          not exists(select 1 from drive_migration_items scan_item where scan_item.migration_id=m.id
-            and (coalesce(scan_item.progress->'migrationInventory'->>'status','')<>'completed'
-              or coalesce(scan_item.progress->'migrationQueue'->>'status','')<>'completed'))
+          i.progress->'migrationInventory'->>'status'='completed'
+          and i.progress->'migrationQueue'->>'status'='completed'
           and not exists(select 1 from drive_repair_jobs j where j.migration_id=m.id
             and j.work_key like format('migration:%s:generation:%s:inventory:%%',m.id,greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1)))
+            and j.payload->'itemIds'->>0=i.id::text
             and j.status<>'completed')
         ))
         and ((v.status='pending' and (v.attempt_count=0 or v.updated_at<=now()-make_interval(mins=>least(30,power(2,least(v.attempt_count,5))::int))))

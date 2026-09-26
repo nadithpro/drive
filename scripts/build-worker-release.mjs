@@ -16,7 +16,7 @@ mkdirSync(output, { recursive: true })
 const definitions = [
   { key: "backend", directory: "backend-orchestrator", file: "backend-orchestrator.mjs", flags: ["nodejs_compat_v2", "enable_ctx_exports"] },
   { key: "scanner", directory: "file-scanner", file: "file-scanner.mjs", flags: ["nodejs_compat_v2"] },
-  { key: "migration", directory: "migration-orchestrator", file: "migration-orchestrator.mjs", flags: ["nodejs_compat_v2", "enable_ctx_exports"] },
+  { key: "migration", directory: "migration-orchestrator", file: "migration-orchestrator.mjs", flags: ["nodejs_compat_v2", "enable_ctx_exports", "global_fetch_strictly_public"] },
 ]
 
 const manifest = { version, createdAt: new Date().toISOString(), workers: {} }

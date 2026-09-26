@@ -1,5 +1,7 @@
 "use client"
 
+import { migrationProgressPercent } from "@/lib/migration-progress"
+
 import * as React from "react"
 import {
   ExternalLink,
@@ -575,7 +577,7 @@ export default function MigrationsPage() {
         skipped,
         failed,
         completed: activeMigration.status === "completed" ? totalObjects : completed,
-        percent: activeMigration.status === "completed" ? 100 : totalObjects > 0 ? (completed / totalObjects) * 100 : 0,
+        percent: migrationProgressPercent(transferred + skipped, totalObjects),
       }
     }
     let totalObjects = 0
@@ -612,10 +614,7 @@ export default function MigrationsPage() {
         : totalObjects > 0
           ? Math.min(totalObjects, transferred + skipped + failed)
           : transferred + skipped + failed
-    const percent =
-      totalObjects > 0
-        ? Math.max(0, Math.min(100, (completed / totalObjects) * 100))
-        : 0
+    const percent = migrationProgressPercent(transferred + skipped, totalObjects)
     return { totalObjects, transferred, skipped, failed, completed, percent }
   }, [activeItems, activeMigration])
 

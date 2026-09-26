@@ -319,7 +319,7 @@ test('migration pool abort and job deletion preserve orchestrator ownership and 
   const jobPage = read('src/app/dashboard/migrations/[id]/jobs/[jobId]/page.tsx')
   const poolPage = read('src/app/dashboard/migrations/[id]/worker-pool/page.tsx')
   const jobsRoute = read('src/app/api/repair-jobs/[id]/route.ts')
-  assert.match(details, /canAbortPool[\s\S]*?runMigrationAction\("cancel_migration"\)[\s\S]*?Details/)
+  assert.match(details, /Details[\s\S]*?canAbortPool[\s\S]*?runMigrationAction\("cancel_migration"\)/)
   assert.match(jobPage, /redirect\(`\/dashboard\/migrations\/\$\{encodeURIComponent\(id\)\}\/worker-pool`\)/)
   assert.match(poolPage, /onClick=\{\(\) => setDeleteOpen\(true\)\}/)
   assert.match(poolPage, /method: "POST" \| "DELETE"/)
@@ -331,8 +331,8 @@ test('migration pool abort and job deletion preserve orchestrator ownership and 
 
 test('migration worker card matches the overview layout and shows durable queue progress', () => {
   const details = read('src/app/dashboard/migrations/[id]/page.tsx')
-  assert.match(details, /<CardTitle className="text-base">Worker pool<\/CardTitle>/)
-  assert.match(details, /<dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">/)
+  assert.match(details, /<span>Worker Pool<\/span>/)
+  assert.match(details, /<dl className="grid gap-y-4 border-y py-4 sm:grid-cols-2 lg:grid-cols-4">/)
   assert.match(details, /const queueRemaining = items\.reduce\(\(sum, item\) => sum \+ getBucketSnapshot\(item\)\.queued, 0\)/)
   assert.match(details, /formatNumber\(overviewProgress\.transferred\)/)
   assert.match(details, /Queue remaining/)
@@ -480,10 +480,11 @@ test('worker-pool migration enforces scan then transfer then independent bucket 
   const runtime = read('workers/migration-worker/migration-worker.mjs')
   const verifyClaim = scanner.slice(scanner.indexOf('async function claim('), scanner.indexOf('async function claimGenericScan'))
   assert.match(orchestrator, /every source inventory is complete and every scanned object/)
-  assert.match(orchestrator, /scan_item\.progress->'migrationInventory'->>'status',''\)<>'completed'/)
-  assert.match(orchestrator, /j\.work_key like \$3 and j\.status<>'completed'/)
+  assert.match(orchestrator, /i\.progress->'migrationInventory'->>'status'='completed'/)
+  assert.match(orchestrator, /j\.work_key like \$3 and j\.payload->'itemIds'->>0=i\.id::text and j\.status<>'completed'/)
   assert.match(verifyClaim, /m\.options->>'executionMode' is distinct from 'migration_workers'/)
   assert.match(verifyClaim, /j\.status<>'completed'/)
+  assert.match(verifyClaim, /j\.payload->'itemIds'->>0=i\.id::text/)
   assert.match(orchestrator, /o\.scan_id is distinct from nullif\(i\.progress->'migrationInventory'->>'sourceScanId'/)
   assert.match(orchestrator, /select i\.id,i\.migration_id,\$2,null,'pending','source'/)
   assert.match(orchestrator, /waiting_for_transfers/)
@@ -529,7 +530,8 @@ test('orchestrator continuously maintains every registered workflow instance', (
   assert.match(orchestrator, /await abortMigrationWorkers\(db, migration\.id/)
   assert.match(orchestrator, /payload->>'workerInstanceId'/)
   assert.doesNotMatch(orchestrator, /const ids = Array\.isArray\(opts\(migration\)\.workerAgentIds\)/)
-  assert.match(runtime, /getArg\("poll-ms", "1000"\)/)
+  assert.match(runtime, /getArg\("poll-ms", "10000"\)/)
+  assert.match(runtime, /Math\.min\(60_000, POLL_MS \* 2 \*\* Math\.min\(idleClaimCount - 1, 3\)\)/)
 })
 
 test('worker job details live only below their migration route', () => {
