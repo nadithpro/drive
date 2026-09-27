@@ -35,6 +35,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
     skipped_objects: string | number
     canceled_jobs: string | number
     jobs: Array<Record<string, unknown>> | null
+    live_files: Array<Record<string, unknown>> | null
     job_page: Array<Record<string, unknown>> | null
     job_total: string | number
     attempts: Array<Record<string, unknown>> | null
@@ -109,8 +110,23 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
         'transferred',transferred,'skipped',skipped,'failed',failed
       ) order by created_at desc,id desc),'[]'::jsonb) job_page
       from paged_jobs
+    ), live_file_projection as (
+      select coalesce(jsonb_agg(j.progress->'currentFile' || jsonb_build_object(
+        'jobId',j.id,'workerId',j.claimed_by_agent_id,'lastHeartbeatAt',j.last_heartbeat_at,'operation',j.mode
+      ) order by j.updated_at desc,j.id),'[]'::jsonb) live_files
+      from public.drive_repair_jobs j
+      where j.migration_id=$1 and j.mode='migration' and j.status in('claimed','running')
+        and j.claimed_by_agent_id is not null
+        and j.last_heartbeat_at>now()-interval '90 seconds'
+        and greatest(1,coalesce(nullif(j.payload->>'workerGeneration','')::int,1))=(select generation from selected_generation)
+        and (select generation from selected_generation)=(select generation from migration_meta)
+        and (select status from migration_meta) in('running','verifying')
+        and jsonb_typeof(j.progress->'currentFile')='object'
+        and nullif(j.progress->'currentFile'->>'key','') is not null
+        and j.progress->'currentFile'->>'status' in('copying','transferring','running')
+        and j.progress->>'active' is distinct from 'false'
     ), recent_jobs as materialized (
-      select id,claimed_by_agent_id,status,progress,result,created_at
+      select id,claimed_by_agent_id,status,mode,progress,result,created_at
       from public.drive_repair_jobs
       where migration_id=$1 and mode='migration'
         and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=(select generation from selected_generation)
@@ -120,6 +136,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       select coalesce(jsonb_agg(jsonb_build_object(
         'id',id,
         'claimed_by_agent_id',claimed_by_agent_id,
+        'mode',mode,
         'status',status,
         'progress',jsonb_build_object(
           'fileEvents',coalesce((
@@ -322,11 +339,11 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       worker_counts.online_workers,worker_counts.active_transfers,
       job_counts.total_jobs,job_counts.queued_jobs,job_counts.running_jobs,
       job_counts.completed_jobs,job_counts.failed_jobs,job_counts.transferred_objects,job_counts.failed_objects,job_counts.canceled_jobs,
-      telemetry.jobs,job_page_projection.job_page,all_job_count.job_total,
+      telemetry.jobs,live_file_projection.live_files,job_page_projection.job_page,all_job_count.job_total,
       attempt_projection.attempts,selected_worker_runs.worker_runs,selected_generation.generation selected_generation,
       migration_meta.status migration_status,bucket_projection.buckets,
       historical_bucket_projection.buckets historical_buckets,migration_meta.generation current_generation
-    from job_counts cross join worker_counts cross join telemetry cross join job_page_projection cross join all_job_count
+    from job_counts cross join worker_counts cross join telemetry cross join live_file_projection cross join job_page_projection cross join all_job_count
       cross join attempt_projection cross join selected_worker_runs cross join selected_generation cross join migration_meta cross join bucket_projection cross join historical_bucket_projection
     left join state on true
   `, [id, pageSize, pageIndex * pageSize, selectedGeneration])
@@ -334,6 +351,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
   if (!stateRow) throw new Error("Migration worker pool query returned no row")
   const saved = stateRow.snapshot ?? {}
   const allJobs = stateRow.jobs ?? []
+  const liveFiles = stateRow.live_files ?? []
   const jobPage = stateRow.job_page ?? []
   const attempts = stateRow.attempts ?? []
   const workerRuns = stateRow.worker_runs ?? []
@@ -356,7 +374,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
     return { ...snapshot, buckets: snapshot.buckets.map((bucket) => isRecord(bucket) ? { ...bucket, status: "aborted", queuedObjects: 0 } : bucket) }
   }
   if (hasCompleteSnapshot(saved) && resolvedGeneration === currentGeneration) {
-    return { snapshot: normalizeTerminalBuckets({ ...saved, ...liveCounts }), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
+    return { snapshot: normalizeTerminalBuckets({ ...saved, ...liveCounts }), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
   }
 
   if (resolvedGeneration !== currentGeneration) {
@@ -381,7 +399,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       buckets,
       updatedAt: attempt.updatedAt ?? stateRow.snapshot_updated_at,
     }
-    return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
+    return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
   }
 
   // Legacy migrations may not have an orchestrator snapshot yet. This narrow
@@ -403,7 +421,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
     ...liveCounts,
     buckets,
   }
-  return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
+  return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
 }
 
 function cachedPool(id: string, pageIndex: number, pageSize: number, selectedGeneration: number) {

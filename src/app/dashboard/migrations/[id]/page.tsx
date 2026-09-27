@@ -38,6 +38,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
+import { DashboardLogsCard } from "@/components/dashboard/logs-card"
 import { DashboardDataTable } from "@/components/dashboard/data-table"
 import {
   getBucketDisplayStatusRank,
@@ -747,14 +748,8 @@ export default function MigrationDetailsPage() {
   const [failedData, setFailedData] = React.useState<FailedDiagnosticsBucket[]>([])
   const [workerRuns, setWorkerRuns] = React.useState<MigrationWorkerRun[]>([])
 
-  const migrationLogsRef = React.useRef<HTMLDivElement | null>(null)
   const bucketLogsRef = React.useRef<HTMLDivElement | null>(null)
 
-  const [migrationLogCols, setMigrationLogCols] = React.useState<{ time: number; bucket: number; stage: number }>({
-    time: 170,
-    bucket: 150,
-    stage: 160,
-  })
   const [bucketLogCols, setBucketLogCols] = React.useState<{ time: number; stage: number }>({
     time: 170,
     stage: 180,
@@ -762,8 +757,8 @@ export default function MigrationDetailsPage() {
 
   const resizeRef = React.useRef<
     | {
-        kind: "migration" | "bucket"
-        key: "time" | "bucket" | "stage"
+        kind: "bucket"
+        key: "time" | "stage"
         pointerId: number
         startX: number
         startWidth: number
@@ -772,20 +767,6 @@ export default function MigrationDetailsPage() {
   >(null)
 
   React.useEffect(() => {
-    try {
-      const raw = localStorage.getItem("drive:migrationLogsCols:v1")
-      if (raw) {
-        const parsed = JSON.parse(raw) as Partial<typeof migrationLogCols>
-        setMigrationLogCols((prev) => ({
-          time: typeof parsed.time === "number" ? parsed.time : prev.time,
-          bucket: typeof parsed.bucket === "number" ? parsed.bucket : prev.bucket,
-          stage: typeof parsed.stage === "number" ? parsed.stage : prev.stage,
-        }))
-      }
-    } catch {
-      // ignore
-    }
-
     try {
       const raw = localStorage.getItem("drive:bucketLogsCols:v1")
       if (raw) {
@@ -808,27 +789,15 @@ export default function MigrationDetailsPage() {
       const delta = e.clientX - active.startX
       const nextWidth = Math.max(110, active.startWidth + delta)
 
-      if (active.kind === "migration") {
-        setMigrationLogCols((prev) => {
-          const next = { ...prev, [active.key]: nextWidth } as typeof prev
-          try {
-            localStorage.setItem("drive:migrationLogsCols:v1", JSON.stringify(next))
-          } catch {
-            // ignore
-          }
-          return next
-        })
-      } else {
-        setBucketLogCols((prev) => {
-          const next = { ...prev, [active.key]: nextWidth } as typeof prev
-          try {
-            localStorage.setItem("drive:bucketLogsCols:v1", JSON.stringify(next))
-          } catch {
-            // ignore
-          }
-          return next
-        })
-      }
+      setBucketLogCols((prev) => {
+        const next = { ...prev, [active.key]: nextWidth } as typeof prev
+        try {
+          localStorage.setItem("drive:bucketLogsCols:v1", JSON.stringify(next))
+        } catch {
+          // ignore
+        }
+        return next
+      })
     }
 
     const onUp = () => {
@@ -891,12 +860,6 @@ export default function MigrationDetailsPage() {
       transientIssues: failedData.reduce((sum, group) => sum + (group.summary.transientOrProviderIssues || 0), 0),
     }
   }, [failedData])
-
-  React.useEffect(() => {
-    const el = migrationLogsRef.current
-    if (!el) return
-    el.scrollTop = el.scrollHeight
-  }, [logLines.length])
 
   React.useEffect(() => {
     const el = bucketLogsRef.current
@@ -2019,127 +1982,15 @@ export default function MigrationDetailsPage() {
       />
 
 
-      <section className="relative">
-          <Card className="gap-0 md:gap-0 overflow-hidden rounded-3xl border border-border/70 p-0">
-            <div className="border-b px-4 py-3">
-              <CardTitle className="text-sm">Migration Logs</CardTitle>
-            </div>
-            <ScrollArea ref={migrationLogsRef} className="max-h-[420px] rounded-b-3xl" hideScrollbar>
-                <div className="min-w-[900px] text-xs font-mono">
-                  <div className="sticky top-0 z-10 border-b bg-background/80 px-3 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-                    <div
-                      className="grid gap-3 text-[11px] text-muted-foreground select-none"
-                      style={{
-                        gridTemplateColumns: `${migrationLogCols.time}px ${migrationLogCols.bucket}px ${migrationLogCols.stage}px 1fr`,
-                      }}
-                    >
-                      <div className="relative pr-8">
-                        Time
-                        <div
-                          className="absolute right-0 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-muted-foreground/70 hover:bg-muted/40 hover:text-muted-foreground cursor-col-resize"
-                          role="separator"
-                          aria-label="Resize Time column"
-                          onPointerDown={(e) => {
-                            e.preventDefault()
-                            e.stopPropagation()
-                            resizeRef.current = {
-                              kind: "migration",
-                              key: "time",
-                              pointerId: e.pointerId,
-                              startX: e.clientX,
-                              startWidth: migrationLogCols.time,
-                            }
-                            try {
-                              ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
-                            } catch {
-                              // ignore
-                            }
-                          }}
-                        >
-                          <GripVertical className="h-4 w-4" />
-                        </div>
-                      </div>
-                      <div className="relative pr-8">
-                        Bucket
-                        <div
-                          className="absolute right-0 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-muted-foreground/70 hover:bg-muted/40 hover:text-muted-foreground cursor-col-resize"
-                          role="separator"
-                          aria-label="Resize Bucket column"
-                          onPointerDown={(e) => {
-                            e.preventDefault()
-                            e.stopPropagation()
-                            resizeRef.current = {
-                              kind: "migration",
-                              key: "bucket",
-                              pointerId: e.pointerId,
-                              startX: e.clientX,
-                              startWidth: migrationLogCols.bucket,
-                            }
-                            try {
-                              ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
-                            } catch {
-                              // ignore
-                            }
-                          }}
-                        >
-                          <GripVertical className="h-4 w-4" />
-                        </div>
-                      </div>
-                      <div className="relative pr-8">
-                        Stage / Status
-                        <div
-                          className="absolute right-0 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-muted-foreground/70 hover:bg-muted/40 hover:text-muted-foreground cursor-col-resize"
-                          role="separator"
-                          aria-label="Resize Stage column"
-                          onPointerDown={(e) => {
-                            e.preventDefault()
-                            e.stopPropagation()
-                            resizeRef.current = {
-                              kind: "migration",
-                              key: "stage",
-                              pointerId: e.pointerId,
-                              startX: e.clientX,
-                              startWidth: migrationLogCols.stage,
-                            }
-                            try {
-                              ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
-                            } catch {
-                              // ignore
-                            }
-                          }}
-                        >
-                          <GripVertical className="h-4 w-4" />
-                        </div>
-                      </div>
-                      <div>Message</div>
-                    </div>
-                  </div>
-                  <div className="space-y-1 px-3 py-2">
-                    {logLines.map((line, idx) => (
-                      <div
-                        key={`${line.atIso}-${line.bucket}-${idx}`}
-                        className="grid gap-3"
-                        style={{
-                          gridTemplateColumns: `${migrationLogCols.time}px ${migrationLogCols.bucket}px ${migrationLogCols.stage}px 1fr`,
-                        }}
-                      >
-                        <div className="truncate text-muted-foreground">{formatLogTime(line.atIso)}</div>
-                        <div className="truncate">{line.bucket}</div>
-                        <div className="truncate text-muted-foreground">
-                          {line.stage ? `${line.stage}${line.verificationGeneration ? ` · generation ${line.verificationGeneration}${line.verificationHistorical ? " (not current)" : ""}` : line.verificationAttemptUnknown ? " · attempt unknown (legacy event)" : ""}` : "-"}
-                          {line.status ? ` - ${line.status}` : ""}
-                        </div>
-                        <div className="whitespace-pre-wrap break-words">{line.message || "-"}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-            </ScrollArea>
-            {logLines.length === 0 ? (
-              <div className="border-t px-4 py-8 text-center text-sm text-muted-foreground">Waiting for scanner and orchestrator lifecycle events.</div>
-            ) : null}
-          </Card>
-      </section>
+      <DashboardLogsCard
+        title="Migration Logs"
+        entries={logLines.map(line => ({
+          at: line.atIso, context: line.bucket, status: line.status, message: line.message,
+          stage: line.stage ? `${line.stage}${line.verificationGeneration ? ` · generation ${line.verificationGeneration}${line.verificationHistorical ? " (not current)" : ""}` : line.verificationAttemptUnknown ? " · attempt unknown (legacy event)" : ""}` : "",
+        }))}
+        storageKey="drive:migrationLogsCols:v1"
+        emptyState="Waiting for scanner and orchestrator lifecycle events."
+      />
       </div>
 
       <Dialog open={failedOpen} onOpenChange={setFailedOpen}>
@@ -2600,7 +2451,5 @@ export default function MigrationDetailsPage() {
     </div>
   )
 }
-
-
 
 
