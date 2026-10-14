@@ -33,8 +33,17 @@ export async function ensureMigrationQueueSchema(db: Client) {
     create table if not exists drive_migration_queue_workers (
       worker_instance_id text primary key, agent_id uuid, migration_id uuid not null, generation integer not null,
       status text not null default 'online', current_job_id uuid, last_heartbeat_at timestamptz not null default now(),
+      runtime_seconds bigint not null default 0,
       metadata jsonb not null default '{}'::jsonb, updated_at timestamptz not null default now()
     );
+    alter table drive_migration_queue_workers add column if not exists runtime_seconds bigint not null default 0;
+    update drive_migration_queue_workers set
+      runtime_seconds=greatest(0,floor(extract(epoch from (
+        coalesce(nullif(metadata->>'retiredAt','')::timestamptz,last_heartbeat_at)
+        - coalesce(nullif(metadata->>'workerStartedAt','')::timestamptz,last_heartbeat_at)
+      )))::bigint),
+      metadata=metadata||jsonb_build_object('runtimeAccountingVersion',1)
+      where not (metadata ? 'runtimeAccountingVersion');
   `)
 }
 

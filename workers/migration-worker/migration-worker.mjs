@@ -445,8 +445,9 @@ async function heartbeat(extra = {}) {
     }
     QUEUE_GENERATION = Number(meta.generation)
     await db.query(`insert into drive_migration_queue_workers(worker_instance_id,agent_id,migration_id,generation,status,current_job_id,metadata,last_heartbeat_at,updated_at)
-      values($1,$2,$3,$4,'online',$5,jsonb_build_object('workerStartedAt',$7::timestamptz)||$6::jsonb,now(),now())
+      values($1,$2,$3,$4,'online',$5,jsonb_build_object('workerStartedAt',$7::timestamptz,'runtimeAccountingVersion',1)||$6::jsonb,now(),now())
       on conflict(worker_instance_id) do update set status='online',current_job_id=excluded.current_job_id,
+        runtime_seconds=drive_migration_queue_workers.runtime_seconds+case when drive_migration_queue_workers.status='online' then greatest(0,floor(extract(epoch from(now()-drive_migration_queue_workers.last_heartbeat_at)))::bigint) else 0 end,
         metadata=case when drive_migration_queue_workers.metadata ? 'workerStartedAt' then drive_migration_queue_workers.metadata||(excluded.metadata-'workerStartedAt')
           else jsonb_build_object('workerStartedAt',$7::timestamptz)||drive_migration_queue_workers.metadata||(excluded.metadata-'workerStartedAt') end,
         last_heartbeat_at=now(),updated_at=now()`,
@@ -484,7 +485,9 @@ async function heartbeat(extra = {}) {
 
 async function retireWorker(reason) {
   if (!WORKER_INSTANCE_ID) return
-  if (queueClient) return withQueue((db) => db.query(`update drive_migration_queue_workers set status='offline',current_job_id=null,metadata=metadata||$2::jsonb,updated_at=now() where worker_instance_id=$1`, [WORKER_INSTANCE_ID, JSON.stringify({ retireReason: reason, retiredAt: new Date().toISOString() })]))
+  if (queueClient) return withQueue((db) => db.query(`update drive_migration_queue_workers set
+    runtime_seconds=runtime_seconds+case when status='online' then greatest(0,floor(extract(epoch from(now()-last_heartbeat_at)))::bigint) else 0 end,
+    status='offline',current_job_id=null,metadata=metadata||$2::jsonb,updated_at=now() where worker_instance_id=$1`, [WORKER_INSTANCE_ID, JSON.stringify({ retireReason: reason, retiredAt: new Date().toISOString(), runtimeAccountingVersion: 1 })]))
   await api(`/workers/${encodeURIComponent(AGENT_ID)}/retire`, {
     token: AGENT_TOKEN,
     workerInstanceId: WORKER_INSTANCE_ID,
@@ -537,8 +540,9 @@ async function claimJob() {
         lease_expires_at=now()+interval '3 minutes',last_heartbeat_at=now(),updated_at=now()
         where id=$1 returning id,migration_id,generation,payload,progress,result,claim_token,status`, [selected.id, WORKER_INSTANCE_ID, claimToken, validUuid(AGENT_ID) ? AGENT_ID : null])
       await db.query(`insert into drive_migration_queue_workers(worker_instance_id,agent_id,migration_id,generation,status,current_job_id,metadata,last_heartbeat_at,updated_at)
-        values($1,$2,$3,$4,'online',$5,jsonb_build_object('workerStartedAt',$6::timestamptz),now(),now())
+        values($1,$2,$3,$4,'online',$5,jsonb_build_object('workerStartedAt',$6::timestamptz,'runtimeAccountingVersion',1),now(),now())
         on conflict(worker_instance_id) do update set status='online',current_job_id=excluded.current_job_id,
+          runtime_seconds=drive_migration_queue_workers.runtime_seconds+case when drive_migration_queue_workers.status='online' then greatest(0,floor(extract(epoch from(now()-drive_migration_queue_workers.last_heartbeat_at)))::bigint) else 0 end,
           metadata=case when drive_migration_queue_workers.metadata ? 'workerStartedAt' then drive_migration_queue_workers.metadata
             else drive_migration_queue_workers.metadata||excluded.metadata end,last_heartbeat_at=now(),updated_at=now()`,
         [WORKER_INSTANCE_ID, AGENT_ID || null, MIGRATION_ID, meta.generation, selected.id, WORKER_STARTED_AT])
