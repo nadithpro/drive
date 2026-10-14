@@ -55,7 +55,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
           case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint else 0 end failed
           from drive_migration_queue_jobs where migration_id=$1 and generation=$2 order by created_at desc,id desc limit $3 offset $4`, [id, generation, pageSize, pageIndex * pageSize]),
         db.query(`select id,status,payload->'job'->>'mode' mode,progress,result from drive_migration_queue_jobs where migration_id=$1 and generation=$2 order by updated_at desc,id desc limit 20`, [id, generation]),
-        db.query(`select worker_instance_id,agent_id,status,current_job_id,last_heartbeat_at from drive_migration_queue_workers where migration_id=$1 and generation=$2 order by last_heartbeat_at desc`, [id, generation]),
+        db.query(`select worker_instance_id,agent_id,status,current_job_id,last_heartbeat_at from drive_migration_queue_workers where migration_id=$1 and generation=$2 and last_heartbeat_at>now()-interval '24 hours' order by (status='online' and last_heartbeat_at>now()-interval '90 seconds') desc,last_heartbeat_at desc limit 100`, [id, generation]),
         db.query(`with item_rows as (
             select distinct on (item->>'id') item->>'id' item_id,item->>'sourceBucket' source_bucket,item->>'targetBucket' target_bucket,
               case when item->>'sourceObjects' ~ '^[0-9]+$' then (item->>'sourceObjects')::bigint else 0 end source_objects,
@@ -67,10 +67,11 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
           ), job_totals as (
             select payload->'items'->0->>'sourceBucket' source_bucket,payload->'items'->0->>'targetBucket' target_bucket,
               count(*) filter(where status='pending')::bigint queued_objects,
+              count(*) filter(where status in('claimed','running'))::bigint running_jobs,
               count(*) filter(where status='completed')::bigint completed_jobs,
               count(*) filter(where status='canceled')::bigint canceled_jobs,
               coalesce(sum(case when status='completed' then case when result->'items'->0->>'transferred' ~ '^[0-9]+$' then (result->'items'->0->>'transferred')::bigint else 0 end else greatest(case when result->'items'->0->>'transferred' ~ '^[0-9]+$' then (result->'items'->0->>'transferred')::bigint else 0 end,case when progress->>'transferred' ~ '^[0-9]+$' then (progress->>'transferred')::bigint else 0 end) end),0)::bigint transferred_objects,
-              coalesce(sum(case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint else 0 end),0)::bigint failed_objects,
+              coalesce(sum(case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint when status='failed' then 1 else 0 end),0)::bigint failed_objects,
               coalesce(sum(case when result->'items'->0->>'skipped' ~ '^[0-9]+$' then (result->'items'->0->>'skipped')::bigint else 0 end),0)::bigint skipped_objects,max(updated_at) updated_at
             from drive_migration_queue_jobs where migration_id=$1 and generation=$2 group by 1,2
           ) select i.source_bucket,i.target_bucket,i.total_objects,coalesce(j.queued_objects,0)::bigint queued_objects,
@@ -81,13 +82,22 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       ])
       const total = Number(stats.rows[0]?.total_jobs || 0)
       const onlineWorkers = workers.rows.filter((row) => row.status === "online" && Date.now() - Date.parse(row.last_heartbeat_at) < 90_000).length
-      const buckets = bucketRows.rows.map((row, index) => ({ id: `${row.source_bucket || ""}:${row.target_bucket || ""}:${index}`, sourceBucket: row.source_bucket || "", targetBucket: row.target_bucket || "", status: Number(row.queued_objects) ? "running" : Number(row.failed_objects) ? "failed" : Number(row.canceled_jobs) && !Number(row.completed_jobs) ? "canceled" : "completed", totalObjects: Number(row.total_objects), queuedObjects: Number(row.queued_objects), transferredObjects: Number(row.transferred_objects), skippedObjects: Number(row.skipped_objects), failedObjects: Number(row.failed_objects), sourceBytes: Number(row.source_bytes), updatedAt: row.updated_at }))
+      const migrationStatus = String(meta.status || "").toLowerCase()
+      const terminalFailure = ["failed", "verification_failed", "canceled", "cancelled", "aborted"].includes(migrationStatus)
+      const terminalSuccess = migrationStatus === "completed"
+      const hasActiveJobs = Number(stats.rows[0]?.running_jobs || 0) > 0
+      const hasPendingJobs = Number(stats.rows[0]?.remaining_jobs || 0) > 0
+      const attemptStatus = terminalFailure ? "failed" : terminalSuccess ? "completed" : onlineWorkers > 0 || hasActiveJobs ? "running" : meta.seed_complete && hasPendingJobs ? "dispatching" : "processing"
+      const buckets = bucketRows.rows.map((row, index) => ({ id: `${row.source_bucket || ""}:${row.target_bucket || ""}:${index}`, sourceBucket: row.source_bucket || "", targetBucket: row.target_bucket || "", status: Number(row.running_jobs) ? "running" : Number(row.queued_objects) ? "dispatching" : Number(row.failed_objects) ? "failed" : Number(row.canceled_jobs) && !Number(row.completed_jobs) ? "canceled" : "completed", totalObjects: Number(row.total_objects), queuedObjects: Number(row.queued_objects), transferredObjects: Number(row.transferred_objects), skippedObjects: Number(row.skipped_objects), failedObjects: Number(row.failed_objects), sourceBytes: Number(row.source_bytes), updatedAt: row.updated_at }))
       const latestQueueUpdate = stats.rows[0]?.updated_at ? Date.parse(stats.rows[0].updated_at) : 0
       const latestMetaUpdate = meta.updated_at ? Date.parse(meta.updated_at) : 0
       const updatedAt = new Date(Math.max(latestQueueUpdate, latestMetaUpdate) || Date.now()).toISOString()
-      const queueAttempts = [{ generation, status: meta.status, workerCount: workers.rowCount || 0, runningWorkers: onlineWorkers, onlineWorkers, totalJobs: total, queuedJobs: Number(stats.rows[0]?.queued_jobs || 0), runningJobs: Number(stats.rows[0]?.running_jobs || 0), remainingJobs: Number(stats.rows[0]?.remaining_jobs || 0), completedJobs: Number(stats.rows[0]?.completed_jobs || 0), failedJobs: Number(stats.rows[0]?.failed_jobs || 0), canceledJobs: Number(stats.rows[0]?.canceled_jobs || 0), updatedAt }]
+      const queueAttempts = [{ generation, status: attemptStatus, workerCount: onlineWorkers, runningWorkers: onlineWorkers, onlineWorkers, totalJobs: total, queuedJobs: Number(stats.rows[0]?.queued_jobs || 0), runningJobs: Number(stats.rows[0]?.running_jobs || 0), remainingJobs: Number(stats.rows[0]?.remaining_jobs || 0), completedJobs: Number(stats.rows[0]?.completed_jobs || 0), failedJobs: Number(stats.rows[0]?.failed_jobs || 0), canceledJobs: Number(stats.rows[0]?.canceled_jobs || 0), updatedAt }]
       const jobPage = page.rows.map((row) => ({ id: row.id, status: row.status, claimedByAgentId: row.agent_id || row.claimed_by, summary: row.summary, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at, lastHeartbeatAt: row.last_heartbeat_at, completedAt: row.completed_at, objectKey: row.object_key || "", objectSize: Number(row.object_size || 0), sourceBucket: row.source_bucket || "", targetBucket: row.target_bucket || "", transferred: Number(row.transferred || 0), skipped: Number(row.skipped || 0), failed: Number(row.failed || 0) }))
-      const workerRuns = workers.rows.map((row) => ({ id: row.worker_instance_id, agentId: row.agent_id, status: row.status === "online" ? "running" : "completed", online: row.status === "online" && Date.now() - Date.parse(row.last_heartbeat_at) < 90_000, instanceId: row.worker_instance_id, jobId: row.current_job_id, currentStatus: row.current_job_id ? "running" : "idle", lastHeartbeatAt: row.last_heartbeat_at, updatedAt: row.last_heartbeat_at }))
+      const workerRuns = workers.rows.map((row) => {
+        const online = row.status === "online" && Date.now() - Date.parse(row.last_heartbeat_at) < 90_000
+        return { id: row.worker_instance_id, agentId: row.agent_id, status: online ? "running" : "offline", online, instanceId: row.worker_instance_id, jobId: row.current_job_id, currentStatus: row.current_job_id ? "running" : online ? "idle" : "offline", lastHeartbeatAt: row.last_heartbeat_at, updatedAt: row.last_heartbeat_at }
+      })
       return { snapshot: { migrationId: id, workerGeneration: generation, totalJobs: total, queuedJobs: Number(stats.rows[0]?.queued_jobs || 0), runningJobs: Number(stats.rows[0]?.running_jobs || 0), remainingJobs: Number(stats.rows[0]?.remaining_jobs || 0), completedJobs: Number(stats.rows[0]?.completed_jobs || 0), failedJobs: Number(stats.rows[0]?.failed_jobs || 0), canceledJobs: Number(stats.rows[0]?.canceled_jobs || 0), totalObjects: buckets.reduce((sum, bucket) => sum + bucket.totalObjects, 0), transferred: Number(stats.rows[0]?.transferred || 0), skipped: Number(stats.rows[0]?.skipped || 0), failed: Number(stats.rows[0]?.failed || 0), onlineWorkers, activeTransfers: active.rowCount || 0, buckets, updatedAt }, snapshotUpdatedAt: updatedAt, jobs: recent.rows, liveFiles: active.rows.map((row) => ({ ...(row.progress?.currentFile || {}), jobId: row.id, workerId: row.claimed_by, lastHeartbeatAt: row.last_heartbeat_at, operation: row.mode })), jobPage, jobPagination: { pageIndex, pageSize, pageCount: Math.max(1, Math.ceil(total / pageSize)), total }, attempts: queueAttempts, workerRuns, selectedGeneration: generation, migrationStatus: meta.status }
     }, queueSettings.queueDatabaseSsl)
     if (queueProjection) return queueProjection
@@ -527,7 +537,24 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     const pageSize = Math.max(10, Math.min(100, Math.floor(Number(url.searchParams.get("pageSize") || 25) || 25)))
     const selectedGeneration = Math.max(0, Math.floor(Number(url.searchParams.get("generation") || 0) || 0))
     const saved = await cachedPool(id, pageIndex, pageSize, selectedGeneration)
-    return NextResponse.json({ ...saved, source: "database" }, { headers: { "Cache-Control": "no-store, max-age=0" } })
+    const jobId = url.searchParams.get("jobId")
+    let selectedJob: Record<string, unknown> | null = null
+    if (jobId && /^[0-9a-f-]{36}$/i.test(jobId)) {
+      const queueSettings = queueSettingsCache?.value
+      if (queueSettings?.queueDatabaseUrl) {
+        selectedJob = await withMigrationQueueDatabase(queueSettings.queueDatabaseUrl, async (db) => {
+          const row = (await db.query(`select id,migration_id,generation,status,payload,progress,result,summary,error,claimed_by,agent_id,created_at,updated_at,last_heartbeat_at,completed_at
+            from drive_migration_queue_jobs where id=$1 and migration_id=$2 and generation=$3 limit 1`, [jobId, id, saved.selectedGeneration])).rows[0]
+          return row ? { id: row.id, migrationId: row.migration_id, status: row.status, mode: row.payload?.job?.mode || "migration", claimedByAgentId: row.agent_id || row.claimed_by, payload: row.payload || {}, progress: row.progress || {}, result: row.result || {}, summary: row.summary, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at, lastHeartbeatAt: row.last_heartbeat_at, completedAt: row.completed_at } : null
+        }, queueSettings.queueDatabaseSsl)
+      }
+      if (!selectedJob) {
+        const result = await queryDb(`select id,migration_id,status,mode,claimed_by_agent_id,payload,progress,result,summary,error,created_at,updated_at,last_heartbeat_at,completed_at from drive_repair_jobs where id=$1 and migration_id=$2 limit 1`, [jobId, id])
+        const row = result.rows[0]
+        if (row) selectedJob = { id: row.id, migrationId: row.migration_id, status: row.status, mode: row.mode, claimedByAgentId: row.claimed_by_agent_id, payload: row.payload || {}, progress: row.progress || {}, result: row.result || {}, summary: row.summary, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at, lastHeartbeatAt: row.last_heartbeat_at, completedAt: row.completed_at }
+      }
+    }
+    return NextResponse.json({ ...saved, ...(jobId ? { job: selectedJob } : {}), source: "database" }, { headers: { "Cache-Control": "no-store, max-age=0" } })
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },

@@ -445,23 +445,39 @@ async function ensureShards(db: Client, migration: Row) {
   let created = 0
   let queueItem: Row | undefined
   let queueScan: Row | undefined
-  // Do not let a temporarily empty running scan block another bucket whose
-  // scanner pages are already durable.
+  // Wait for a stable, complete inventory before walking it by key. Scanner
+  // writes can arrive out of key order, so advancing this cursor during a
+  // running scan can permanently skip an object inserted behind lastKey.
   for (const candidate of items.rows) {
-    if (Number(candidate.progress?.migrationQueue?.generation) === generation && candidate.progress?.migrationQueue?.status === "completed") continue
+    const queueState = candidate.progress?.migrationQueue || {}
     const scanId = String(candidate.progress?.migrationInventory?.sourceScanId || "")
     if (!scanId) continue
-    const lastKey = Number(candidate.progress?.migrationQueue?.generation) === generation ? String(candidate.progress?.migrationQueue?.lastKey || "") : ""
     const scan = scansByItem.get(candidate.id) || {}
-    const hasPage = scan.status === "completed" || Boolean((await db.query(`
-      select exists(select 1 from drive_bucket_scan_objects where scan_id=$1 and not is_dir_marker and key>$2) has_page
-    `, [scanId, lastKey])).rows[0]?.has_page)
-    if (hasPage || scan.status === "completed") {
-      queueItem = candidate
-      queueScan = scan
-      queueScan.id = scanId
-      break
+    if (scan.status !== "completed") continue
+    if (Number(queueState.generation) === generation && queueState.status === "completed") {
+      const coverage = await db.query(`select count(*)::int missing_count
+        from drive_bucket_scan_objects o where o.scan_id=$4 and not o.is_dir_marker
+          and not exists(select 1 from drive_repair_jobs j
+            where j.migration_id=$1 and j.mode='migration'
+              and j.work_key=format('migration:%s:generation:%s:inventory:%s:%s',$1::uuid,$2::int,$3::uuid,encode(convert_to(o.key,'UTF8'),'hex'))
+              and j.payload->'itemIds' @> jsonb_build_array($3::text)
+              and exists(select 1 from jsonb_array_elements(coalesce(j.payload->'inventoryObjects','[]'::jsonb)) inv where inv->>'key'=o.key))`,
+      [migration.id, generation, candidate.id, scanId])
+      if (Number(coverage.rows[0]?.missing_count || 0) === 0) continue
+      const attempts = Number(queueState.integrityRepairAttempts || 0)
+      candidate.progress = { ...(candidate.progress || {}), migrationQueue: {
+        ...queueState, generation, status: "materializing", lastKey: "", materializedObjects: 0,
+        totalObjects: Number(scan.objects || candidate.source_objects || 0),
+        integrityRepairAttempts: attempts + 1, integrityRepairMissing: Number(coverage.rows[0]?.missing_count || 0),
+        updatedAt: new Date().toISOString(),
+      } }
+      await db.query(`update drive_migration_items set progress=jsonb_set(coalesce(progress,'{}'::jsonb),'{migrationQueue}',$2::jsonb),updated_at=now() where id=$1`,
+        [candidate.id, JSON.stringify(candidate.progress.migrationQueue)])
     }
+    queueItem = candidate
+    queueScan = scan
+    queueScan.id = scanId
+    break
   }
   if (queueItem) {
     const lastKey = Number(queueItem.progress?.migrationQueue?.generation) === generation ? String(queueItem.progress?.migrationQueue?.lastKey || "") : ""
@@ -490,14 +506,35 @@ async function ensureShards(db: Client, migration: Row) {
       const pageCount = Number(materialized.rows[0]?.page_count || 0)
       created += Number(materialized.rows[0]?.created || 0)
       tuneQueueBatchSize(Date.now() - queueStartedAt, true)
-      // A temporary end of the persisted prefix is not end-of-inventory while
-      // File Scanner is still listing. Only its completed state closes queueing.
-      const completed = queueScan?.status === "completed" && pageCount === 0
-      const nextKey = String(materialized.rows[0]?.next_key || lastKey)
+      let missingCount = 0
+      if (queueScan?.status === "completed" && pageCount === 0) {
+        const coverage = await db.query(`select count(*)::int missing_count
+          from drive_bucket_scan_objects o where o.scan_id=$4 and not o.is_dir_marker
+            and not exists(select 1 from drive_repair_jobs j
+              where j.migration_id=$1 and j.mode='migration'
+                and j.work_key=format('migration:%s:generation:%s:inventory:%s:%s',$1::uuid,$2::int,$3::uuid,encode(convert_to(o.key,'UTF8'),'hex'))
+                and j.payload->'itemIds' @> jsonb_build_array($3::text)
+                and exists(select 1 from jsonb_array_elements(coalesce(j.payload->'inventoryObjects','[]'::jsonb)) inv where inv->>'key'=o.key))`,
+        [migration.id, generation, queueItem.id, queueScan.id])
+        missingCount = Number(coverage.rows[0]?.missing_count || 0)
+      }
+      const priorQueue = queueItem.progress?.migrationQueue || {}
+      const integrityAttempts = Number(priorQueue.integrityRepairAttempts || 0)
+      if (missingCount > 0 && integrityAttempts > 0) {
+        const message = `Migration queue integrity check still found ${missingCount} scanned object(s) without a durable file job for ${queueItem.source_bucket}`
+        const failedProgress = { ...priorQueue, status: "failed", integrityError: message, integrityRepairMissing: missingCount, updatedAt: new Date().toISOString() }
+        await db.query(`update drive_migration_items set slurper_status='precheck_failed',progress=jsonb_set(coalesce(progress,'{}'::jsonb),'{migrationQueue}',$2::jsonb),last_progress_at=now(),updated_at=now() where id=$1`, [queueItem.id, JSON.stringify(failedProgress)])
+        await db.query(`update drive_migrations set status='failed',sync_status='failed',sync_message=$2,last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [migration.id, message])
+        await db.query("commit")
+        return { generation, shardCount: 0, created, inventoryPending: 0, queuePending: 0, terminalFailure: true, targetBuckets }
+      }
+      const retryCoverage = missingCount > 0
+      const completed = queueScan?.status === "completed" && pageCount === 0 && missingCount === 0
+      const nextKey = retryCoverage ? "" : String(materialized.rows[0]?.next_key || lastKey)
       const priorMaterialized = Number(queueItem.progress?.migrationQueue?.generation) === generation
         ? Number(queueItem.progress?.migrationQueue?.materializedObjects || 0)
         : 0
-      await db.query(`update drive_migration_items set progress=jsonb_set(coalesce(progress,'{}'::jsonb),'{migrationQueue}',$2::jsonb),updated_at=now() where id=$1`, [queueItem.id, JSON.stringify({ generation, status: completed ? "completed" : "materializing", lastKey: nextKey, materializedObjects: priorMaterialized + pageCount, totalObjects: Number(queueItem.source_objects || queueScan?.objects || 0), updatedAt: new Date().toISOString() })])
+      await db.query(`update drive_migration_items set progress=jsonb_set(coalesce(progress,'{}'::jsonb),'{migrationQueue}',$2::jsonb),updated_at=now() where id=$1`, [queueItem.id, JSON.stringify({ generation, status: completed ? "completed" : "materializing", lastKey: nextKey, materializedObjects: retryCoverage ? 0 : priorMaterialized + pageCount, totalObjects: Number(queueItem.source_objects || queueScan?.objects || 0), integrityRepairAttempts: integrityAttempts + (retryCoverage ? 1 : 0), integrityRepairMissing: retryCoverage ? missingCount : 0, updatedAt: new Date().toISOString() })])
       await db.query("commit")
     } catch (error) {
       tuneQueueBatchSize(Number.MAX_SAFE_INTEGER, false)

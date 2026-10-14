@@ -20,13 +20,22 @@ async function seedQueue(db: import("pg").Client, migrationId: string, generatio
     lease_expires_at=null,updated_at=now() where migration_id=$1 and generation<$2 and status not in('completed','failed','canceled')`, [migrationId, generation])
   await db.query(`insert into drive_migration_queue_meta(migration_id,generation,status) values($1,$2,'seeding') on conflict(migration_id,generation) do nothing`, [migrationId, generation])
   const meta = (await db.query(`select seed_cursor,seed_complete from drive_migration_queue_meta where migration_id=$1 and generation=$2 for update`, [migrationId, generation])).rows[0]
-  if (meta.seed_complete) return { inserted: 0, complete: true }
   let cursorAt: string | null = null
   let cursorId: string | null = null
   if (meta.seed_cursor) {
     const split = String(meta.seed_cursor).split("|")
     cursorAt = split[0] || null
     cursorId = split[1] || null
+  }
+  if (meta.seed_complete) {
+    const lateJobs = await queryDb<Row>(`select exists(select 1 from drive_repair_jobs j
+      where j.migration_id=$1 and j.mode='migration'
+        and greatest(1,coalesce(nullif(j.payload->>'workerGeneration','')::int,1))=$2
+        and ($3::timestamptz is null or (j.created_at,j.id)>($3::timestamptz,$4::uuid))) has_late_jobs`,
+    [migrationId, generation, cursorAt, cursorId])
+    if (!lateJobs.rows[0]?.has_late_jobs) return { inserted: 0, complete: true }
+    await db.query(`update drive_migration_queue_meta set seed_complete=false,status='seeding',updated_at=now()
+      where migration_id=$1 and generation=$2`, [migrationId, generation])
   }
   const { rows } = await queryDb<Row>(`
     select j.id,j.migration_id,j.status,j.mode,j.work_key,j.payload job_payload,j.progress,j.result,j.summary,j.error,j.claimed_by_agent_id,j.claim_token,j.created_at,j.created_at::text seed_created_at,j.updated_at,
