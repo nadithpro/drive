@@ -3,6 +3,8 @@ import { syncWorkerRepository } from "../../../src/lib/github-worker-sync"
 
 type DispatchMessage = { intentId: string } | { control: "cycle" }
 type Env = { POSTGRES_URL?: string; HYPERDRIVE?: { connectionString: string }; MIGRATION_ORCHESTRATOR_SECRET?: string; PANEL_URL?: string; DISABLE_POSTGRES_SSL?: string; GITHUB_WORKER_SOURCE_REPO?: string; GITHUB_DISPATCH_QUEUE: Queue<DispatchMessage> }
+// Database rows are dynamically shaped by the PostgreSQL queries below.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Row = Record<string, any>
 const BUILD = 36
 const MIN_QUEUE_BATCH_SIZE = 500
@@ -1298,6 +1300,24 @@ async function workerEndpointAvailable(db: Client, migrationId: string, orchestr
   return true
 }
 
+async function migrationQueueRequest(db: Client, env: Env, action: "seed" | "sync", migrationId: string, generation: number) {
+  const configured = await db.query(`select value from drive_app_settings where key='migration-workers' limit 1`)
+  const settings = configured.rows[0]?.value || {}
+  if (!String(settings.queueDatabaseUrl || "").trim()) return { configured: false, complete: false, inserted: 0, synced: 0 }
+  const originRow = await db.query(`select value->>'panelOrigin' panel_origin from drive_app_settings where key='orchestration-panel-origin' limit 1`)
+  const base = String(env.PANEL_URL || originRow.rows[0]?.panel_origin || "").trim().replace(/\/+$/, "")
+  if (!base) throw new Error("Panel URL is unavailable for migration queue synchronization")
+  const response = await fetch(`${base}/api/internal/migration-queue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${String(env.MIGRATION_ORCHESTRATOR_SECRET || "")}` },
+    body: JSON.stringify({ action, migrationId, generation, limit: 1000 }),
+    signal: AbortSignal.timeout(45_000),
+  })
+  const result = await response.json().catch(() => ({})) as Row
+  if (!response.ok || result.ok !== true) throw new Error(`Migration queue ${action} failed (HTTP ${response.status}): ${String(result.error || "unknown error")}`)
+  return { configured: true, complete: result.complete === true, inserted: Number(result.inserted || 0), synced: Number(result.synced || 0) }
+}
+
 async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   const generation = integer(opts(migration).workerGeneration, 1, 1, 1000000)
   const stopped = await db.query(`
@@ -1313,7 +1333,8 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   if (!(await githubWorkerSecretsAreCurrent(orchestration, workerSettings))) return 0
   // Missing heartbeats during an endpoint outage do not mean the GitHub
   // processes need replacing. Keep their slots and durable file checkpoints.
-  if (!(await workerEndpointAvailable(db, migration.id, orchestration))) return 0
+  const directQueueMode = Boolean(String(workerSettings.queueDatabaseUrl || "").trim())
+  if (!directQueueMode && !(await workerEndpointAvailable(db, migration.id, orchestration))) return 0
   // Persist the grace across queue invocations: a worker may still be in its
   // five-minute quota cooldown when the public endpoint first recovers.
   const recovery = await db.query(`select options->>'workerEndpointRecoveryUntil' recovery_until from drive_migrations where id=$1`, [migration.id])
@@ -1672,7 +1693,7 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb,summary='Submitting GitHub workflow dispatch',updated_at=now() where id=$1`, [intent.id, JSON.stringify({ phase: "dispatching", dispatchStartedAt: new Date().toISOString(), dispatchAttempt: attempts })])
     const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(intent.github_repo_owner)}/${encodeURIComponent(intent.github_repo_name)}/dispatches`, {
       method: "POST", headers: { Authorization: `Bearer ${intent.github_token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Drive-Migration-Orchestrator", "Content-Type": "application/json" },
-      body: JSON.stringify({ event_type: "drive-migration-worker", client_payload: { migration_id: intent.payload.migrationId, agent_id: intent.agent_id, worker_instance_id: workerInstanceId, workflow_file: intent.github_workflow_file || ".github/workflows/migration-worker.yml", code_ref: codeSync.targetSha, max_runtime_seconds: GITHUB_WORKER_MAX_RUNTIME_SECONDS } }), signal: AbortSignal.timeout(20_000),
+      body: JSON.stringify({ event_type: "drive-migration-worker", client_payload: { migration_id: intent.payload.migrationId, worker_generation: intent.payload.workerGeneration, agent_id: intent.agent_id, worker_instance_id: workerInstanceId, workflow_file: intent.github_workflow_file || ".github/workflows/migration-worker.yml", code_ref: codeSync.targetSha, max_runtime_seconds: GITHUB_WORKER_MAX_RUNTIME_SECONDS } }), signal: AbortSignal.timeout(20_000),
     })
     if (!response.ok) throw new Error(`GitHub dispatch HTTP ${response.status}`)
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb,summary='GitHub accepted workflow dispatch; awaiting run reconciliation',updated_at=now() where id=$1`, [intent.id, JSON.stringify({ phase: "accepted", acceptedAt: new Date().toISOString() })])
@@ -1786,12 +1807,27 @@ async function workerRequest(request: Request, env: Env, path: string) {
       return json({ ok: true, agentId })
     })
   }
-  const match = /^\/workers\/([0-9a-f-]{36})(?:\/(heartbeat|retire|claim-job|jobs\/([0-9a-f-]{36})))?$/i.exec(path)
+  const match = /^\/workers\/([0-9a-f-]{36})(?:\/(heartbeat|retire|claim-job|bootstrap|jobs\/([0-9a-f-]{36})))?$/i.exec(path)
   if (!match) return json({ error: "Not found" }, 404)
   return database(env, async (db) => {
     const agent = await workerAuthorized(db, match[1], body.token)
     if (!agent) return json({ error: "Invalid worker secret" }, 401)
     const action = match[2] || "register"
+    if (action === "bootstrap") {
+      const migrationId = typeof body.migrationId === "string" ? body.migrationId : ""
+      const migration = (await db.query(`select id,status,greatest(1,coalesce(nullif(options->>'workerGeneration','')::int,1)) generation from drive_migrations where id=$1 limit 1`, [migrationId])).rows[0]
+      if (!migration || !["running", "verifying"].includes(String(migration.status))) return json({ error: "Migration is missing or no longer active" }, 409)
+      const requestedGeneration = Number(body.generation || 0)
+      if (Number.isInteger(requestedGeneration) && requestedGeneration > 0 && requestedGeneration !== Number(migration.generation)) return json({ error: "Worker generation has been superseded" }, 409)
+      if (!Array.isArray(agent.capabilities) || !agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered for migration pool work" }, 409)
+      const settings = (await db.query(`select value from drive_app_settings where key='migration-workers' limit 1`)).rows[0]?.value || {}
+      const queueDatabaseUrl = String(settings.queueDatabaseUrl || "").trim()
+      const queueDatabaseSsl = settings.queueDatabaseSsl !== false
+      let parsed: URL | null = null
+      try { parsed = new URL(queueDatabaseUrl) } catch { /* validated below */ }
+      if (!parsed || !["postgres:", "postgresql:"].includes(parsed.protocol) || !parsed.hostname || !parsed.username || !parsed.password) return json({ error: "Migration queue database is not configured or is invalid" }, 503)
+      return json({ ok: true, migrationId, generation: Number(migration.generation), queueDatabaseUrl, queueDatabaseSsl }, 200)
+    }
     const now = new Date().toISOString()
     if (action === "register" || action === "heartbeat") {
       await db.query(`update drive_agents set status='online',last_heartbeat_at=now(),last_seen_host=$2,last_seen_version=$3,capabilities=case when jsonb_array_length($4::jsonb)>0 then $4::jsonb else capabilities end,metadata=coalesce(metadata,'{}'::jsonb)||$5::jsonb,updated_at=now(),last_error=null where id=$1 and status<>'disabled'`, [agent.id, String(body.host || "").slice(0, 255) || null, String(body.version || "").slice(0, 80) || null, JSON.stringify(Array.isArray(body.capabilities) ? body.capabilities : []), JSON.stringify(body.metadata && typeof body.metadata === "object" ? body.metadata : {})])
@@ -2008,6 +2044,19 @@ async function cycle(env: Env) {
             : "Building migration queue for migration workers"
         await db.query(`update drive_migrations set sync_status='running',sync_message=$2,last_synced_at=now(),updated_at=now() where id=$1 and status='running'`, [migration.id, syncMessage])
       }
+      const queueConfiguration = await db.query(`select value->>'queueDatabaseUrl' queue_url from drive_app_settings where key='migration-workers' limit 1`)
+      const directQueueMode = Boolean(String(queueConfiguration.rows[0]?.queue_url || "").trim())
+      let queueSeed = { configured: false, complete: false, inserted: 0, synced: 0 }
+      let queueMirror = { configured: false, complete: false, inserted: 0, synced: 0 }
+      if (directQueueMode) {
+        if (!shards.inventoryPending && !shards.queuePending && !shards.terminalFailure) {
+          queueSeed = await migrationQueueRequest(db, env, "seed", migration.id, shards.generation)
+          // Keep the main database quiet while a large scanner inventory is
+          // being copied in seed batches. No worker is dispatched until the
+          // whole generation is present, so mirror once seeding is complete.
+          if (queueSeed.complete) queueMirror = await migrationQueueRequest(db, env, "sync", migration.id, shards.generation)
+        }
+      }
       await ensureBucketVerification(db, migration, shards.generation)
       await refreshWorkerItemProgress(db, migration, shards.generation)
       await finalizeVerifiedBuckets(db, migration, shards.generation)
@@ -2026,18 +2075,19 @@ async function cycle(env: Env) {
       const current = (await db.query(`select * from drive_migrations where id=$1`, [migration.id])).rows[0]
       if (["completed", "failed", "verification_failed", "canceled", "aborted"].includes(String(current?.status || "").toLowerCase())) {
         await abortMigrationWorkers(db, migration.id, `Migration is ${current.status}; stopping remaining GitHub workers`)
+        if (directQueueMode) queueMirror = await migrationQueueRequest(db, env, "sync", migration.id, shards.generation)
       }
       // Keep scanning and copying as separate phases. The worker pool starts
       // only after every source inventory is complete and every scanned object
       // has been materialized into a durable migration job. This prevents a
       // partially scanned repair from looking like an active worker run.
-      const inventoryReady = !shards.inventoryPending && !shards.queuePending
+      const inventoryReady = !shards.inventoryPending && !shards.queuePending && (!directQueueMode || queueSeed.complete)
       const hasRunnableFiles = shards.shardCount > 0 || shards.created > 0
       const dispatched = current?.status === "running" && inventoryReady && hasRunnableFiles ? await dispatchWorkers(db, env, current) : 0
       await recordItemStageEvents(db, migration, shards.generation)
-      if (shards.inventoryPending || shards.queuePending) await env.GITHUB_DISPATCH_QUEUE.send({ control: "cycle" })
+      if (shards.inventoryPending || shards.queuePending || (directQueueMode && !queueSeed.complete)) await env.GITHUB_DISPATCH_QUEUE.send({ control: "cycle" })
       await db.query(`update drive_migrations set last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [migration.id])
-      return complete(db, owner, migration.id, { ok: true, migrationId, ...shards, recovered, finalized, ...verification, bucketSettings, fileScanner, dispatched })
+      return complete(db, owner, migration.id, { ok: true, migrationId, ...shards, migrationQueue: directQueueMode ? { seed: queueSeed, mirror: queueMirror } : null, recovered, finalized, ...verification, bucketSettings, fileScanner, dispatched })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       await db.query(`update drive_migration_orchestrator_state set status='error',lease_owner=null,lease_expires_at=null,last_completed_at=now(),last_error=$1,last_migration_id=$2,last_result=$3::jsonb,updated_at=now() where id=true and lease_owner=$4`, [message, migrationId, JSON.stringify({ ok: false, error: message }), owner]).catch(() => undefined)
