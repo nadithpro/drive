@@ -26,8 +26,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 type WorkerJob = { id: string; status: string; mode?: string; claimedByAgentId?: string; claimed_by_agent_id?: string; progress?: Record<string, unknown>; result?: Record<string, unknown> }
 type JobRow = { id: string; status: string; claimedByAgentId?: string; summary?: string; error?: string; createdAt?: string; updatedAt?: string; lastHeartbeatAt?: string; completedAt?: string; objectKey?: string; objectSize?: number; sourceBucket?: string; targetBucket?: string; transferred?: number; skipped?: number; failed?: number }
 type RepairJob = { id: string; migrationId: string; status: string; mode: string; claimedByAgentId?: string; payload: Record<string, unknown>; progress: Record<string, unknown>; result: Record<string, unknown>; summary?: string; error?: string; createdAt?: string; updatedAt?: string }
-type BucketStat = { id: string; sourceBucket: string; targetBucket: string; status: string; totalObjects: number; queuedObjects?: number; transferredObjects: number; skippedObjects: number; failedObjects: number; sourceBytes: number }
-type PoolSnapshot = { workerGeneration?: number; onlineWorkers?: number; activeTransfers?: number; totalJobs?: number; queuedJobs?: number; runningJobs?: number; remainingJobs?: number; completedJobs?: number; failedJobs?: number; canceledJobs?: number; totalObjects?: number; transferred?: number; skipped?: number; failed?: number; processedFiles?: number; completedBytes?: number; buckets?: BucketStat[]; updatedAt?: string }
+type BucketStat = { id: string; sourceBucket: string; targetBucket: string; status: string; totalObjects: number; queuedObjects?: number; runningObjects?: number; transferredObjects: number; skippedObjects: number; failedObjects: number; sourceBytes: number }
+type PoolSnapshot = { workerGeneration?: number; onlineWorkers?: number; activeTransfers?: number; totalJobs?: number; queuedJobs?: number; runningJobs?: number; remainingJobs?: number; completedJobs?: number; failedJobs?: number; canceledJobs?: number; totalObjects?: number; transferred?: number; skipped?: number; failed?: number; processedFiles?: number; completedBytes?: number; inProgressBytes?: number; workerRuntimeSeconds?: number; buckets?: BucketStat[]; updatedAt?: string; sampledAt?: string }
 type Pagination = { pageIndex: number; pageSize: number; pageCount: number; total: number }
 type PoolAttempt = { generation: number; status: string; workerCount: number; runningWorkers: number; onlineWorkers: number; totalJobs: number; queuedJobs: number; runningJobs: number; remainingJobs?: number; completedJobs: number; failedJobs: number; canceledJobs: number; createdAt?: string; updatedAt?: string }
 type PoolWorkerRun = { id: string; agentId: string; status: string; online: boolean; abortRequested?: boolean; externalRunId?: string; instanceId?: string; jobId?: string; currentStatus?: string; lastHeartbeatAt?: string; completedFiles?: number; failedFiles?: number; completedBytes?: number; createdAt?: string; updatedAt?: string }
@@ -37,6 +37,7 @@ function num(value: unknown) { const parsed = Number(value); return Number.isFin
 function formatNumber(value: number) { return new Intl.NumberFormat().format(Math.max(0, value)) }
 function formatDate(value?: string) { if (!value) return "—"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString() }
 function formatBytes(value: number) { if (value <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; let size = value; let unit = 0; while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1 } return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[unit]}` }
+function formatWorkerHours(value: number) { const seconds = Math.max(0, Math.floor(value)); return `${(seconds / 3600).toFixed(2)} h` }
 function percentage(done: number, total: number) { return total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0 }
 
 function WorkerTableDate({ value }: { value?: string }) {
@@ -77,6 +78,7 @@ export default function MigrationWorkerPoolDetailsPage() {
   const [jobs, setJobs] = React.useState<WorkerJob[]>([])
   const [liveFiles, setLiveFiles] = React.useState<Array<Record<string, unknown>>>([])
   const [liveNow, setLiveNow] = React.useState(() => Date.now())
+  const [workerRuntimeSampledAt, setWorkerRuntimeSampledAt] = React.useState(() => Date.now())
   const [jobPage, setJobPage] = React.useState<JobRow[]>([])
   const [pagination, setPagination] = React.useState<Pagination>({ pageIndex: 0, pageSize: 25, pageCount: 1, total: 0 })
   const [snapshot, setSnapshot] = React.useState<PoolSnapshot>({})
@@ -91,6 +93,7 @@ export default function MigrationWorkerPoolDetailsPage() {
   const [loading, setLoading] = React.useState(true)
   const [refreshing, setRefreshing] = React.useState(false)
   const [mutating, setMutating] = React.useState(false)
+  const [queueReadFailed, setQueueReadFailed] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
   const inFlight = React.useRef(false)
 
@@ -106,6 +109,7 @@ export default function MigrationWorkerPoolDetailsPage() {
       const [poolResponse, detailResponse] = await Promise.all([poolRequest, detailRequest])
       const data = await poolResponse.json().catch(() => ({}))
       if (!poolResponse.ok) throw new Error(data.error || "Unable to load migration worker pool")
+      setQueueReadFailed(data.queueReadFailed === true)
       if (selectedGenerationRef.current > 0 && Number(data.selectedGeneration) !== selectedGenerationRef.current) return
       setJobs(Array.isArray(data.jobs) ? data.jobs : [])
       setLiveFiles(Array.isArray(data.liveFiles) ? data.liveFiles.filter(isRecord) : [])
@@ -114,10 +118,11 @@ export default function MigrationWorkerPoolDetailsPage() {
       setSnapshot((previous) => {
         const incoming = isRecord(data.snapshot) ? data.snapshot as PoolSnapshot : {}
         const sameGeneration = Number(previous.workerGeneration || 0) === Number(incoming.workerGeneration || 0)
-        const previousTime = Date.parse(String(previous.updatedAt || ""))
-        const incomingTime = Date.parse(String(incoming.updatedAt || ""))
+        const previousTime = Date.parse(String(previous.sampledAt || previous.updatedAt || ""))
+        const incomingTime = Date.parse(String(incoming.sampledAt || incoming.updatedAt || ""))
         return sameGeneration && Number.isFinite(previousTime) && Number.isFinite(incomingTime) && incomingTime < previousTime ? previous : incoming
       })
+      if (data.dataSource === "queue_database") setWorkerRuntimeSampledAt(Date.now())
       setAttempts(Array.isArray(data.attempts) ? data.attempts : [])
       setWorkerRuns(Array.isArray(data.workerRuns) ? data.workerRuns : [])
       if (selectedGeneration === 0 && Number(data.selectedGeneration) > 0) setSelectedGeneration(Number(data.selectedGeneration))
@@ -138,7 +143,8 @@ export default function MigrationWorkerPoolDetailsPage() {
   }, [migrationId, pagination.pageIndex, pagination.pageSize, selectedGeneration, selectedJobId])
 
   React.useEffect(() => { void load() }, [load])
-  React.useEffect(() => { const timer = window.setInterval(() => { setLiveNow(Date.now()); void load({ background: true }) }, 10_000); return () => window.clearInterval(timer) }, [load])
+  React.useEffect(() => { const timer = window.setInterval(() => setLiveNow(Date.now()), 1_000); return () => window.clearInterval(timer) }, [])
+  React.useEffect(() => { const timer = window.setInterval(() => void load({ background: true }), 10_000); return () => window.clearInterval(timer) }, [load])
   React.useEffect(() => { setLiveFiles([]) }, [migrationId, selectedGeneration])
 
   const openJob = React.useCallback(async (id: string) => {
@@ -178,6 +184,7 @@ export default function MigrationWorkerPoolDetailsPage() {
     })) }
   }, [jobs, snapshot.buckets])
   const activeFiles = React.useMemo(() => currentMigrationFiles(liveFiles, liveNow), [liveFiles, liveNow])
+  const copyingFiles = activeFiles.filter((file) => ["copying", "transferring"].includes(String(file.status || "").toLowerCase()))
 
   const bucketColumns = React.useMemo<ColumnDef<BucketStat, unknown>[]>(() => [
     {
@@ -193,6 +200,7 @@ export default function MigrationWorkerPoolDetailsPage() {
     { accessorKey: "targetBucket", header: "Target", meta: { width: "min-w-[200px]", align: "center" }, cell: ({ row }) => <span className="break-all text-[13px] font-medium">{row.original.targetBucket}</span> },
     { accessorKey: "status", header: "Status", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }) => <div className="flex min-h-10 items-center justify-center">{statusBadge(poolBucketTransferStatus(row.original))}</div> },
     ...(snapshot.buckets?.some((bucket) => num(bucket.queuedObjects) > 0) ? [{ id: "queue", header: "Queue", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }: { row: { original: BucketStat } }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.queuedObjects))}</span> }] : []),
+    ...(snapshot.buckets?.some((bucket) => num(bucket.runningObjects) > 0) ? [{ id: "inProgress", header: "In progress", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }: { row: { original: BucketStat } }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.runningObjects))}</span> }] : []),
     { id: "transferred", header: "Transferred", meta: { width: "min-w-[130px]", align: "center" }, cell: ({ row }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.transferredObjects))}</span> },
     ...(snapshot.buckets?.some((bucket) => num(bucket.skippedObjects) > 0) ? [{ id: "skipped", header: "Skipped", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }: { row: { original: BucketStat } }) => <span className="text-[13px] font-medium tabular-nums">{formatNumber(num(row.original.skippedObjects))}</span> }] : []),
     ...(snapshot.buckets?.some((bucket) => num(bucket.failedObjects) > 0) ? [{ id: "failed", header: "Failed", meta: { width: "min-w-[120px]", align: "center" }, cell: ({ row }: { row: { original: BucketStat } }) => <span className="text-[13px] font-medium tabular-nums text-destructive">{formatNumber(num(row.original.failedObjects))}</span> }] : []),
@@ -330,9 +338,10 @@ export default function MigrationWorkerPoolDetailsPage() {
     ? num(selectedAttempt.completedJobs) + num(selectedAttempt.failedJobs) + num(selectedAttempt.canceledJobs)
     : processedFiles
   const overallPercent = percentage(attemptProcessedJobs, attemptTotalJobs)
+  const workerRuntimeSeconds = num(snapshot.workerRuntimeSeconds) + Math.max(0, Math.floor((liveNow - workerRuntimeSampledAt) / 1_000))
 
   return <DashboardPage className="dashboard-motion-stage">
-    <DashboardPageHeader title="Migration worker pools" description={`${formatLastSyncedAt(snapshot.updatedAt)} - automatically refreshes every 10 seconds`} actions={<div className="flex w-full gap-2 sm:w-auto"><Button asChild variant="outline" size="sm" className="flex-1 rounded-xl sm:flex-none"><Link href={`/dashboard/migrations/${encodeURIComponent(migrationId)}`}><ArrowLeft data-icon="inline-start" />Back</Link></Button><Button variant="outline" size="sm" className="flex-1 rounded-xl sm:flex-none" onClick={() => void load({ manual: true })} disabled={refreshing}><RefreshCw data-icon="inline-start" className={refreshing ? "animate-spin" : undefined} />Refresh</Button></div>} />
+    <DashboardPageHeader title="Migration worker pools" description={`${formatLastSyncedAt(snapshot.updatedAt)} - automatically refreshes every 10 seconds${queueReadFailed ? " - queue database unavailable; showing saved primary database data" : ""}`} actions={<div className="flex w-full gap-2 sm:w-auto"><Button asChild variant="outline" size="sm" className="flex-1 rounded-xl sm:flex-none"><Link href={`/dashboard/migrations/${encodeURIComponent(migrationId)}`}><ArrowLeft data-icon="inline-start" />Back</Link></Button><Button variant="outline" size="sm" className="flex-1 rounded-xl sm:flex-none" onClick={() => void load({ manual: true })} disabled={refreshing}><RefreshCw data-icon="inline-start" className={refreshing ? "animate-spin" : undefined} />Refresh</Button></div>} />
     <Tabs value={tab} onValueChange={setTab} className="gap-5">
       <TabsList>
         <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -340,8 +349,8 @@ export default function MigrationWorkerPoolDetailsPage() {
         <TabsTrigger value="pool-jobs">Worker pool jobs <Badge variant="outline">{formatNumber(attempts.length)}</Badge></TabsTrigger>
       </TabsList>
       <TabsContent value="overview" className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-4 xl:grid-cols-5"><MetricCard label="Migration objects" value={formatNumber(num(snapshot.totalObjects))} detail={`${formatNumber(buckets.length)} buckets`} icon={Files} /><MetricCard label="File queue" value={formatNumber(attemptTotalJobs)} detail={`${formatNumber(attemptQueuedJobs)} queued - ${formatNumber(attemptRunningJobs)} running`} icon={Clock3} /><MetricCard label="Transferred" value={formatNumber(num(snapshot.transferred))} detail={`${formatBytes(num(snapshot.completedBytes))} copied`} icon={CircleCheck} /><MetricCard label="Skipped" value={formatNumber(num(snapshot.skipped))} detail="Existing objects preserved" icon={Files} /><MetricCard label="Pool workers" value={formatNumber(num(selectedAttempt?.workerCount))} detail={`${formatNumber(num(selectedAttempt?.onlineWorkers))} online`} icon={Workflow} /></div>
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(280px,0.45fr)]"><Card className="gap-0 py-0"><CardHeader className="border-b px-5 py-4"><div className="flex items-center justify-between gap-4"><div><CardTitle className="text-base">Attempt progress</CardTitle><CardDescription>Durable queue completion for the selected worker pool.</CardDescription></div><span className="font-mono text-sm font-semibold tabular-nums">{overallPercent.toFixed(1)}%</span></div></CardHeader><CardContent className="flex flex-col gap-5 px-5 py-5"><Progress value={overallPercent} className="h-2.5" /><div className="grid grid-cols-2 gap-4 sm:grid-cols-4">{[["Processed", attemptProcessedJobs], ["Completed", num(selectedAttempt?.completedJobs)], ["Failed", num(selectedAttempt?.failedJobs)], ["Canceled", num(selectedAttempt?.canceledJobs)]].map(([label, value]) => <div key={String(label)}><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-lg font-semibold tabular-nums">{formatNumber(Number(value))}</p></div>)}</div></CardContent></Card><Card className="gap-0 py-0"><CardHeader className="border-b px-4 py-4"><CardTitle className="text-base">Attempt activity</CardTitle><CardDescription>Selected pool generation.</CardDescription></CardHeader><CardContent className="flex flex-col gap-3 px-4 py-4 text-sm">{[["Online workers", num(selectedAttempt?.onlineWorkers)], ["Running workflows", num(selectedAttempt?.runningWorkers)], ["Queue remaining", attemptRemainingJobs]].map(([label, value]) => <div key={String(label)} className="flex items-center justify-between"><span className="text-muted-foreground">{label}</span><span className="font-semibold tabular-nums">{formatNumber(Number(value))}</span></div>)}<div className="flex items-center justify-between gap-4"><span className="text-muted-foreground">Last update</span><span className="text-right text-xs">{formatDate(selectedAttempt?.updatedAt || snapshot.updatedAt)}</span></div></CardContent></Card></div>
+        <div className="grid grid-cols-2 gap-4 xl:grid-cols-5"><MetricCard label="Migration objects" value={formatNumber(num(snapshot.totalObjects))} detail={`${formatNumber(buckets.length)} buckets`} icon={Files} /><MetricCard label="File queue" value={formatNumber(attemptTotalJobs)} detail={`${formatNumber(attemptQueuedJobs)} queued - ${formatNumber(attemptRunningJobs)} running`} icon={Clock3} /><MetricCard label="Transferred" value={formatNumber(num(snapshot.transferred))} detail={`${formatBytes(num(snapshot.completedBytes))} copied - ${formatBytes(num(snapshot.inProgressBytes))} in progress`} icon={CircleCheck} /><MetricCard label="Skipped" value={formatNumber(num(snapshot.skipped))} detail="Existing objects preserved" icon={Files} /><MetricCard label="Worker hours" value={formatWorkerHours(workerRuntimeSeconds)} detail={`${formatNumber(num(selectedAttempt?.onlineWorkers))} online - elapsed time across all worker instances`} icon={Workflow} /></div>
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(280px,0.45fr)]"><Card className="gap-0 py-0"><CardHeader className="border-b px-5 py-4"><div className="flex items-center justify-between gap-4"><div><CardTitle className="text-base">Attempt progress</CardTitle><CardDescription>Completed jobs count toward progress; active jobs are shown separately until they finish.</CardDescription></div><span className="font-mono text-sm font-semibold tabular-nums">{overallPercent.toFixed(1)}%</span></div></CardHeader><CardContent className="flex flex-col gap-5 px-5 py-5"><Progress value={overallPercent} className="h-2.5" /><div className="grid grid-cols-2 gap-4 sm:grid-cols-5">{[["Processed", attemptProcessedJobs], ["In progress", attemptRunningJobs], ["Completed", num(selectedAttempt?.completedJobs)], ["Failed", num(selectedAttempt?.failedJobs)], ["Canceled", num(selectedAttempt?.canceledJobs)]].map(([label, value]) => <div key={String(label)}><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-lg font-semibold tabular-nums">{formatNumber(Number(value))}</p></div>)}</div></CardContent></Card><Card className="gap-0 py-0"><CardHeader className="border-b px-4 py-4"><CardTitle className="text-base">Attempt activity</CardTitle><CardDescription>Selected pool generation.</CardDescription></CardHeader><CardContent className="flex flex-col gap-3 px-4 py-4 text-sm">{[["Online workers", num(selectedAttempt?.onlineWorkers)], ["Running workflows", num(selectedAttempt?.runningWorkers)], ["Queue remaining", attemptRemainingJobs], ["Files copying now", copyingFiles.length]].map(([label, value]) => <div key={String(label)} className="flex items-center justify-between"><span className="text-muted-foreground">{label}</span><span className="font-semibold tabular-nums">{formatNumber(Number(value))}</span></div>)}<div className="flex items-center justify-between gap-4"><span className="text-muted-foreground">Last update</span><span className="text-right text-xs">{formatDate(selectedAttempt?.updatedAt || snapshot.updatedAt)}</span></div></CardContent></Card></div>
         <DashboardDataTable
           data={buckets}
           columns={bucketColumns}

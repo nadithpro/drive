@@ -22,6 +22,7 @@ function hasCompleteSnapshot(snapshot: Record<string, unknown>) {
 
 async function readPool(id: string, pageIndex: number, pageSize: number, selectedGeneration: number) {
   const now = Date.now()
+  let queueReadFailed = false
   if (!queueSettingsCache || queueSettingsCache.expiresAt <= now) {
     queueSettingsCache = { expiresAt: now + 30_000, value: await getMigrationWorkerSettings() }
   }
@@ -41,8 +42,15 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
         count(*) filter(where status='failed')::bigint failed_jobs,
         count(*) filter(where status='canceled')::bigint canceled_jobs,
         coalesce(sum(case when status='completed' then case when result->'items'->0->>'transferred' ~ '^[0-9]+$' then (result->'items'->0->>'transferred')::bigint else 0 end when status in('claimed','running') then greatest(case when result->'items'->0->>'transferred' ~ '^[0-9]+$' then (result->'items'->0->>'transferred')::bigint else 0 end,case when progress->>'transferred' ~ '^[0-9]+$' then (progress->>'transferred')::bigint else 0 end) else 0 end),0)::bigint transferred,
-        coalesce(sum(case when result->'items'->0->>'skipped' ~ '^[0-9]+$' then (result->'items'->0->>'skipped')::bigint else 0 end),0)::bigint skipped,
-        coalesce(sum(case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint else 0 end),0)::bigint failed,
+        coalesce(sum(case when result->'items'->0->>'skipped' ~ '^[0-9]+$' then (result->'items'->0->>'skipped')::bigint when status in('claimed','running') and progress->>'skipped' ~ '^[0-9]+$' then (progress->>'skipped')::bigint else 0 end),0)::bigint skipped,
+        coalesce(sum(case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint when status='failed' then 1 else 0 end),0)::bigint failed,
+        coalesce(sum(case when status='completed' and result->'items'->0->>'transferred' ~ '^[0-9]+$' and (result->'items'->0->>'transferred')::bigint>0 and payload->'inventoryObjects'->0->>'size' ~ '^[0-9]+$' then (payload->'inventoryObjects'->0->>'size')::bigint else 0 end),0)::bigint completed_bytes,
+        coalesce(sum(case when status in('claimed','running') and progress->'currentFile'->>'bytesTransferred' ~ '^[0-9]+$' then (progress->'currentFile'->>'bytesTransferred')::bigint else 0 end),0)::bigint in_progress_bytes,
+        coalesce((select sum(greatest(0,extract(epoch from (
+          coalesce(nullif(w.metadata->>'retiredAt','')::timestamptz,
+            case when w.status='online' and w.last_heartbeat_at>now()-interval '90 seconds' then now() else w.last_heartbeat_at end)
+          - coalesce(nullif(w.metadata->>'workerStartedAt','')::timestamptz,w.last_heartbeat_at)))::bigint)
+          from drive_migration_queue_workers w where w.migration_id=$1 and w.generation=$2),0)::bigint worker_runtime_seconds,
         max(updated_at) updated_at
         from drive_migration_queue_jobs where migration_id=$1 and generation=$2`, [id, generation])).rows[0]
       const [page, recent, workers, bucketRows, active] = await Promise.all([
@@ -55,7 +63,17 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
           case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint else 0 end failed
           from drive_migration_queue_jobs where migration_id=$1 and generation=$2 order by created_at desc,id desc limit $3 offset $4`, [id, generation, pageSize, pageIndex * pageSize]),
         db.query(`select id,status,payload->'job'->>'mode' mode,progress,result from drive_migration_queue_jobs where migration_id=$1 and generation=$2 order by updated_at desc,id desc limit 20`, [id, generation]),
-        db.query(`select worker_instance_id,agent_id,status,current_job_id,last_heartbeat_at from drive_migration_queue_workers where migration_id=$1 and generation=$2 and last_heartbeat_at>now()-interval '24 hours' order by (status='online' and last_heartbeat_at>now()-interval '90 seconds') desc,last_heartbeat_at desc limit 100`, [id, generation]),
+        db.query(`with worker_totals as (
+            select claimed_by worker_instance_id,
+              coalesce(sum(case when status in('completed','claimed','running') and result->'items'->0->>'transferred' ~ '^[0-9]+$' then greatest((result->'items'->0->>'transferred')::bigint,case when progress->>'transferred' ~ '^[0-9]+$' then (progress->>'transferred')::bigint else 0 end) when status in('claimed','running') and progress->>'transferred' ~ '^[0-9]+$' then (progress->>'transferred')::bigint else 0 end),0)::bigint completed_files,
+              coalesce(sum(case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint when status='failed' then 1 else 0 end),0)::bigint failed_files,
+              coalesce(sum(case when status='completed' and result->'items'->0->>'transferred' ~ '^[0-9]+$' and (result->'items'->0->>'transferred')::bigint>0 and payload->'inventoryObjects'->0->>'size' ~ '^[0-9]+$' then (payload->'inventoryObjects'->0->>'size')::bigint else 0 end),0)::bigint completed_bytes
+            from drive_migration_queue_jobs where migration_id=$1 and generation=$2 and claimed_by is not null group by claimed_by
+          ) select w.worker_instance_id,w.agent_id,w.status,w.current_job_id,w.last_heartbeat_at,w.metadata,
+              coalesce(t.completed_files,0)::bigint completed_files,coalesce(t.failed_files,0)::bigint failed_files,coalesce(t.completed_bytes,0)::bigint completed_bytes
+            from drive_migration_queue_workers w left join worker_totals t using(worker_instance_id)
+            where w.migration_id=$1 and w.generation=$2 and w.last_heartbeat_at>now()-interval '24 hours'
+            order by (w.status='online' and w.last_heartbeat_at>now()-interval '90 seconds') desc,w.last_heartbeat_at desc limit 100`, [id, generation]),
         db.query(`with item_rows as (
             select distinct on (item->>'id') item->>'id' item_id,item->>'sourceBucket' source_bucket,item->>'targetBucket' target_bucket,
               case when item->>'sourceObjects' ~ '^[0-9]+$' then (item->>'sourceObjects')::bigint else 0 end source_objects,
@@ -72,9 +90,10 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
               count(*) filter(where status='canceled')::bigint canceled_jobs,
               coalesce(sum(case when status='completed' then case when result->'items'->0->>'transferred' ~ '^[0-9]+$' then (result->'items'->0->>'transferred')::bigint else 0 end else greatest(case when result->'items'->0->>'transferred' ~ '^[0-9]+$' then (result->'items'->0->>'transferred')::bigint else 0 end,case when progress->>'transferred' ~ '^[0-9]+$' then (progress->>'transferred')::bigint else 0 end) end),0)::bigint transferred_objects,
               coalesce(sum(case when result->'items'->0->>'failed' ~ '^[0-9]+$' then (result->'items'->0->>'failed')::bigint when status='failed' then 1 else 0 end),0)::bigint failed_objects,
-              coalesce(sum(case when result->'items'->0->>'skipped' ~ '^[0-9]+$' then (result->'items'->0->>'skipped')::bigint else 0 end),0)::bigint skipped_objects,max(updated_at) updated_at
+              coalesce(sum(case when result->'items'->0->>'skipped' ~ '^[0-9]+$' then (result->'items'->0->>'skipped')::bigint when status in('claimed','running') and progress->>'skipped' ~ '^[0-9]+$' then (progress->>'skipped')::bigint else 0 end),0)::bigint skipped_objects,max(updated_at) updated_at
             from drive_migration_queue_jobs where migration_id=$1 and generation=$2 group by 1,2
           ) select i.source_bucket,i.target_bucket,i.total_objects,coalesce(j.queued_objects,0)::bigint queued_objects,
+              coalesce(j.running_jobs,0)::bigint running_objects,
               coalesce(j.transferred_objects,0)::bigint transferred_objects,coalesce(j.failed_objects,0)::bigint failed_objects,
               coalesce(j.skipped_objects,0)::bigint skipped_objects,i.source_bytes,j.updated_at
             from item_totals i left join job_totals j using(source_bucket,target_bucket) order by i.source_bucket,i.target_bucket`, [id, generation]),
@@ -88,7 +107,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       const hasActiveJobs = Number(stats.rows[0]?.running_jobs || 0) > 0
       const hasPendingJobs = Number(stats.rows[0]?.remaining_jobs || 0) > 0
       const attemptStatus = terminalFailure ? "failed" : terminalSuccess ? "completed" : onlineWorkers > 0 || hasActiveJobs ? "running" : meta.seed_complete && hasPendingJobs ? "dispatching" : "processing"
-      const buckets = bucketRows.rows.map((row, index) => ({ id: `${row.source_bucket || ""}:${row.target_bucket || ""}:${index}`, sourceBucket: row.source_bucket || "", targetBucket: row.target_bucket || "", status: Number(row.running_jobs) ? "running" : Number(row.queued_objects) ? "dispatching" : Number(row.failed_objects) ? "failed" : Number(row.canceled_jobs) && !Number(row.completed_jobs) ? "canceled" : "completed", totalObjects: Number(row.total_objects), queuedObjects: Number(row.queued_objects), transferredObjects: Number(row.transferred_objects), skippedObjects: Number(row.skipped_objects), failedObjects: Number(row.failed_objects), sourceBytes: Number(row.source_bytes), updatedAt: row.updated_at }))
+      const buckets = bucketRows.rows.map((row, index) => ({ id: `${row.source_bucket || ""}:${row.target_bucket || ""}:${index}`, sourceBucket: row.source_bucket || "", targetBucket: row.target_bucket || "", status: Number(row.running_objects) ? "running" : Number(row.queued_objects) ? "dispatching" : Number(row.failed_objects) ? "failed" : Number(row.canceled_jobs) && !Number(row.completed_jobs) ? "canceled" : "completed", totalObjects: Number(row.total_objects), queuedObjects: Number(row.queued_objects), runningObjects: Number(row.running_objects), transferredObjects: Number(row.transferred_objects), skippedObjects: Number(row.skipped_objects), failedObjects: Number(row.failed_objects), sourceBytes: Number(row.source_bytes), updatedAt: row.updated_at }))
       const latestQueueUpdate = stats.rows[0]?.updated_at ? Date.parse(stats.rows[0].updated_at) : 0
       const latestMetaUpdate = meta.updated_at ? Date.parse(meta.updated_at) : 0
       const updatedAt = new Date(Math.max(latestQueueUpdate, latestMetaUpdate) || Date.now()).toISOString()
@@ -96,12 +115,14 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       const jobPage = page.rows.map((row) => ({ id: row.id, status: row.status, claimedByAgentId: row.agent_id || row.claimed_by, summary: row.summary, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at, lastHeartbeatAt: row.last_heartbeat_at, completedAt: row.completed_at, objectKey: row.object_key || "", objectSize: Number(row.object_size || 0), sourceBucket: row.source_bucket || "", targetBucket: row.target_bucket || "", transferred: Number(row.transferred || 0), skipped: Number(row.skipped || 0), failed: Number(row.failed || 0) }))
       const workerRuns = workers.rows.map((row) => {
         const online = row.status === "online" && Date.now() - Date.parse(row.last_heartbeat_at) < 90_000
-        return { id: row.worker_instance_id, agentId: row.agent_id, status: online ? "running" : "offline", online, instanceId: row.worker_instance_id, jobId: row.current_job_id, currentStatus: row.current_job_id ? "running" : online ? "idle" : "offline", lastHeartbeatAt: row.last_heartbeat_at, updatedAt: row.last_heartbeat_at }
+        return { id: row.worker_instance_id, agentId: row.agent_id, status: online ? "running" : "offline", online, instanceId: row.worker_instance_id, jobId: row.current_job_id, currentStatus: row.current_job_id ? "running" : online ? "idle" : "offline", startedAt: row.metadata?.workerStartedAt, retiredAt: row.metadata?.retiredAt, lastHeartbeatAt: row.last_heartbeat_at, completedFiles: Number(row.completed_files || 0), failedFiles: Number(row.failed_files || 0), completedBytes: Number(row.completed_bytes || 0), updatedAt: row.last_heartbeat_at }
       })
-      return { snapshot: { migrationId: id, workerGeneration: generation, totalJobs: total, queuedJobs: Number(stats.rows[0]?.queued_jobs || 0), runningJobs: Number(stats.rows[0]?.running_jobs || 0), remainingJobs: Number(stats.rows[0]?.remaining_jobs || 0), completedJobs: Number(stats.rows[0]?.completed_jobs || 0), failedJobs: Number(stats.rows[0]?.failed_jobs || 0), canceledJobs: Number(stats.rows[0]?.canceled_jobs || 0), totalObjects: buckets.reduce((sum, bucket) => sum + bucket.totalObjects, 0), transferred: Number(stats.rows[0]?.transferred || 0), skipped: Number(stats.rows[0]?.skipped || 0), failed: Number(stats.rows[0]?.failed || 0), onlineWorkers, activeTransfers: active.rowCount || 0, buckets, updatedAt }, snapshotUpdatedAt: updatedAt, jobs: recent.rows, liveFiles: active.rows.map((row) => ({ ...(row.progress?.currentFile || {}), jobId: row.id, workerId: row.claimed_by, lastHeartbeatAt: row.last_heartbeat_at, operation: row.mode })), jobPage, jobPagination: { pageIndex, pageSize, pageCount: Math.max(1, Math.ceil(total / pageSize)), total }, attempts: queueAttempts, workerRuns, selectedGeneration: generation, migrationStatus: meta.status }
+      return { snapshot: { migrationId: id, workerGeneration: generation, totalJobs: total, queuedJobs: Number(stats.rows[0]?.queued_jobs || 0), runningJobs: Number(stats.rows[0]?.running_jobs || 0), remainingJobs: Number(stats.rows[0]?.remaining_jobs || 0), completedJobs: Number(stats.rows[0]?.completed_jobs || 0), failedJobs: Number(stats.rows[0]?.failed_jobs || 0), canceledJobs: Number(stats.rows[0]?.canceled_jobs || 0), totalObjects: buckets.reduce((sum, bucket) => sum + bucket.totalObjects, 0), transferred: Number(stats.rows[0]?.transferred || 0), completedBytes: Number(stats.rows[0]?.completed_bytes || 0), inProgressBytes: Number(stats.rows[0]?.in_progress_bytes || 0), workerRuntimeSeconds: Number(stats.rows[0]?.worker_runtime_seconds || 0), skipped: Number(stats.rows[0]?.skipped || 0), failed: Number(stats.rows[0]?.failed || 0), onlineWorkers, activeTransfers: active.rowCount || 0, buckets, updatedAt, sampledAt: new Date().toISOString() }, snapshotUpdatedAt: updatedAt, jobs: recent.rows, liveFiles: active.rows.map((row) => ({ ...(row.progress?.currentFile || {}), jobId: row.id, workerId: row.claimed_by, lastHeartbeatAt: row.last_heartbeat_at, operation: row.mode })), jobPage, jobPagination: { pageIndex, pageSize, pageCount: Math.max(1, Math.ceil(total / pageSize)), total }, attempts: queueAttempts, workerRuns, selectedGeneration: generation, migrationStatus: meta.status, dataSource: "queue_database" }
     }, queueSettings.queueDatabaseSsl)
     if (queueProjection) return queueProjection
-    } catch {
+    } catch (error) {
+      queueReadFailed = true
+      console.error("Migration worker-pool queue database projection failed", error instanceof Error ? error.message : String(error))
       // Fall back to the saved primary-database projection while the queue DB is unavailable.
     }
   }
@@ -461,7 +482,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
     return { ...snapshot, buckets: snapshot.buckets.map((bucket) => isRecord(bucket) ? { ...bucket, status: "aborted", queuedObjects: 0 } : bucket) }
   }
   if (hasCompleteSnapshot(saved) && resolvedGeneration === currentGeneration) {
-    return { snapshot: normalizeTerminalBuckets({ ...saved, ...liveCounts }), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
+    return { snapshot: normalizeTerminalBuckets({ ...saved, ...liveCounts }), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus, dataSource: queueReadFailed ? "primary_database_fallback" : "primary_database", queueReadFailed }
   }
 
   if (resolvedGeneration !== currentGeneration) {
@@ -486,7 +507,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
       buckets,
       updatedAt: attempt.updatedAt ?? stateRow.snapshot_updated_at,
     }
-    return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
+    return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus, dataSource: queueReadFailed ? "primary_database_fallback" : "primary_database", queueReadFailed }
   }
 
   // Legacy migrations may not have an orchestrator snapshot yet. This narrow
@@ -508,7 +529,7 @@ async function readPool(id: string, pageIndex: number, pageSize: number, selecte
     ...liveCounts,
     buckets,
   }
-  return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus }
+  return { snapshot: normalizeTerminalBuckets(snapshot), snapshotUpdatedAt: stateRow.snapshot_updated_at, jobs: allJobs, liveFiles, jobPage, jobPagination, attempts, workerRuns, selectedGeneration: resolvedGeneration, migrationStatus, dataSource: queueReadFailed ? "primary_database_fallback" : "primary_database", queueReadFailed }
 }
 
 function cachedPool(id: string, pageIndex: number, pageSize: number, selectedGeneration: number) {

@@ -10,7 +10,6 @@ const BUILD = 36
 const MIN_QUEUE_BATCH_SIZE = 500
 const DEFAULT_QUEUE_BATCH_SIZE = 2_000
 const MAX_QUEUE_BATCH_SIZE = 4_000
-const MAX_GITHUB_WORKFLOW_WORKERS = 5
 const GITHUB_WORKER_MAX_RUNTIME_SECONDS = 21_300
 const MAX_SECRET_LENGTH = 512
 const TRANSIENT_SCAN_SQL_PATTERN = "(connection terminated unexpectedly|connection reset|connection closed|server closed the connection unexpectedly|client has encountered a connection error|not queryable|socket hang up|econnreset|econnrefused|etimedout|timeout|timed out|eai_again|enotfound|enetunreach|epipe|fetch failed|temporar(y|ily) unavailable|too many (requests|connections|clients)|slow down|throttl|HTTP (408|425|429|500|502|503|504)|57P01|57P03|53300|08[0-9A-Z]{3}|40001|40P01)"
@@ -1499,9 +1498,7 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
         agentOccupancy += 1
       }
     }
-    const workflowRuns = activeByWorkflow.get(workflowKey) || new Set<string>()
-    const workflowVacancies = Math.max(0, MAX_GITHUB_WORKFLOW_WORKERS - workflowRuns.size)
-    const vacancies = Math.min(workflowVacancies, Math.max(0, Number(agent.worker_count || 1) - agentOccupancy))
+    const vacancies = Math.max(0, Number(agent.worker_count || 1) - agentOccupancy)
     for (let slot = 0; slot < vacancies && queued < budget; slot += 1) {
       const workerInstanceId = crypto.randomUUID()
       const intent = await db.query(`
@@ -1517,7 +1514,6 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
       if (!intent.rows[0]) return queued
       await env.GITHUB_DISPATCH_QUEUE.send({ intentId: intent.rows[0].id }, { contentType: "json" })
       await db.query(`update drive_agent_runs set payload=payload||'{"phase":"queued"}'::jsonb,summary='Queued for independent GitHub dispatch consumer',updated_at=now() where id=$1`, [intent.rows[0].id])
-      workflowRuns.add(`pending:${intent.rows[0].id}`)
       queued += 1
     }
   }
