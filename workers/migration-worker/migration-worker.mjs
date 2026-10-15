@@ -458,7 +458,10 @@ async function api(path, body, options = {}) {
 }
 
 async function heartbeat(extra = {}) {
-  if (queueClient) return withQueue(async (db) => {
+  // The client is intentionally closed after a short idle period. Keep using
+  // the direct queue path based on configuration so each heartbeat reconnects
+  // to Neon instead of silently falling back to the panel database/API.
+  if (QUEUE_DATABASE_URL) return withQueue(async (db) => {
     const migrationId = MIGRATION_ID
     if (!migrationId || !WORKER_INSTANCE_ID) throw new Error("Queue worker identity or migration scope is missing")
     const meta = (await db.query(`select generation,status from drive_migration_queue_meta where migration_id=$1 and ($2::int=0 or generation=$2) order by generation desc limit 1`, [migrationId, QUEUE_GENERATION])).rows[0]
@@ -509,7 +512,7 @@ async function heartbeat(extra = {}) {
 
 async function retireWorker(reason) {
   if (!WORKER_INSTANCE_ID) return
-  if (queueClient) return withQueue((db) => db.query(`update drive_migration_queue_workers set
+  if (QUEUE_DATABASE_URL) return withQueue((db) => db.query(`update drive_migration_queue_workers set
     runtime_seconds=runtime_seconds+case when status='online' then greatest(0,floor(extract(epoch from(now()-last_heartbeat_at)))::bigint) else 0 end,
     status='offline',current_job_id=null,metadata=metadata||$2::jsonb,updated_at=now() where worker_instance_id=$1`, [WORKER_INSTANCE_ID, JSON.stringify({ retireReason: reason, retiredAt: new Date().toISOString(), runtimeAccountingVersion: 1 })]))
   await api(`/workers/${encodeURIComponent(AGENT_ID)}/retire`, {
@@ -539,7 +542,7 @@ async function releaseJobForRotation(jobId) {
 }
 
 async function claimJob() {
-  if (queueClient) return withQueue(async (db) => {
+  if (QUEUE_DATABASE_URL) return withQueue(async (db) => {
     if (!MIGRATION_ID || !WORKER_INSTANCE_ID) throw new Error("Migration queue claims require migration id and worker instance id")
     await db.query("begin")
     try {
@@ -592,7 +595,7 @@ async function claimJob() {
 }
 
 async function updateJob(jobId, body, options = {}) {
-  if (queueClient) return withQueue(async (db) => {
+  if (QUEUE_DATABASE_URL) return withQueue(async (db) => {
     const claimToken = jobClaimTokens.get(jobId)
     const status = String(body.status || "running")
     const released = status === "pending"
@@ -2245,7 +2248,7 @@ function stopHeartbeatLoop() {
 }
 
 async function main() {
-  console.log(`Worker starting for agent ${AGENT_ID} using ${queueClient ? "the migration queue database" : SERVER_URL}`)
+  console.log(`Worker starting for agent ${AGENT_ID} using ${QUEUE_DATABASE_URL ? "the migration queue database" : SERVER_URL}`)
   console.log(
     `Copy tuning: ${COPY_CONCURRENCY} object(s) in parallel, ${RANGE_COPY_CONCURRENCY} ranged part(s) per large object, ${UPLOAD_QUEUE_SIZE} upload part(s) per streamed object, ${Math.round(UPLOAD_PART_SIZE / 1024 / 1024)} MB parts`
   )
