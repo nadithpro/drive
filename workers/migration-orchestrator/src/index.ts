@@ -2987,6 +2987,14 @@ async function cycle(env: Env) {
       const inventoryReady = !shards.inventoryPending && !shards.queuePending && (!directQueueMode || queueSeed.complete)
       const hasRunnableFiles = shards.shardCount > 0 || shards.created > 0
       const dispatched = current?.status === "running" && inventoryReady && hasRunnableFiles ? await dispatchWorkers(db, env, current) : 0
+      if (inventoryReady && hasRunnableFiles && current && ["running", "verifying"].includes(String(current.status))) {
+        const verifying = finalized.complete
+        await db.query(`update drive_migrations set sync_status=$2,sync_message=$3,last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [
+          migration.id,
+          verifying ? "verifying" : "running",
+          verifying ? "Migration workers finished; verifying migrated objects" : "Migration workers are transferring files",
+        ])
+      }
       const backendDispatch = current && ["running", "verifying"].includes(String(current.status))
         ? await dispatchBackendWorkers(db, env, current)
         : { dispatched: 0, reason: "migration_not_active" }
