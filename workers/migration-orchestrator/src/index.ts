@@ -689,7 +689,7 @@ async function recoverJobs(db: Client, migrationId: string, generation: number, 
 async function recoverQueueFailedJobs(db: Client, migrationId: string, generation: number) {
   const settings = (await db.query(`select value from drive_app_settings where key='migration-workers' limit 1`)).rows[0]?.value || {}
   const queueUrl = String(settings.queueDatabaseUrl || "").trim()
-  if (!queueUrl) return { configured: false, retried: 0 }
+  if (!queueUrl) return { configured: false, retried: 0, activeWorkerInstances: [] as string[] }
   const parsed = new URL(queueUrl)
   const sslMode = parsed.searchParams.get("sslmode")
   parsed.searchParams.delete("sslmode")
@@ -704,6 +704,7 @@ async function recoverQueueFailedJobs(db: Client, migrationId: string, generatio
   let retries: Array<{ id: string; retry_count: number; progress: Row; result: Row; summary: string }> = []
   let terminalFailure = false
   let failedItems: Array<{ item_id: string; failed_jobs: number }> = []
+  let activeWorkerInstances: string[] = []
   try {
     await queue.query("begin")
     try {
@@ -740,6 +741,9 @@ async function recoverQueueFailedJobs(db: Client, migrationId: string, generatio
         where q.migration_id=$1 and q.generation=$2 and nullif(item->>'id','') is not null
         group by item->>'id'`, [migrationId, generation])
       failedItems = buckets.rows.filter((row) => Number(row.failed_jobs || 0) > 0 && Number(row.remaining_jobs || 0) === 0)
+      const workers = await queue.query(`select worker_instance_id from drive_migration_queue_workers
+        where migration_id=$1 and generation=$2 and status='online' and last_heartbeat_at>now()-interval '90 seconds'`, [migrationId, generation])
+      activeWorkerInstances = workers.rows.map((row) => String(row.worker_instance_id))
       await queue.query("commit")
     } catch (error) { await queue.query("rollback").catch(() => undefined); throw error }
   } finally { await queue.end().catch(() => undefined) }
@@ -759,7 +763,7 @@ async function recoverQueueFailedJobs(db: Client, migrationId: string, generatio
     await db.query(`update drive_migrations set status='failed',sync_status='failed',sync_message='Migration worker retries exhausted; failed queue jobs remain',last_synced_at=now(),updated_at=now()
       where id=$1 and status in('running','verifying')`, [migrationId])
   }
-  return { configured: true, retried: retries.length, terminalFailure, failedBuckets: failedItems.length }
+  return { configured: true, retried: retries.length, terminalFailure, failedBuckets: failedItems.length, activeWorkerInstances }
 }
 async function refreshWorkerItemProgress(db: Client, migration: Row, generation: number, affectedItemIds?: string[]) {
   await db.query(`
@@ -1668,7 +1672,7 @@ async function migrationQueueRequest(db: Client, env: Env, migrationId: string, 
   return { configured: true, complete: result.complete === true, synced: Number(result.synced || 0), cleaned: result.cleaned === true }
 }
 
-async function dispatchWorkers(db: Client, env: Env, migration: Row) {
+async function dispatchWorkers(db: Client, env: Env, migration: Row, activeQueueWorkerInstances: string[] = []) {
   const generation = integer(opts(migration).workerGeneration, 1, 1, 1000000)
   const stopped = await db.query(`
     select 1 from drive_repair_jobs j
@@ -1785,6 +1789,13 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
             await db.query(`update drive_agent_runs set summary='Worker runtime window reached; GitHub cancellation requested before replacement',payload=payload||$2::jsonb,updated_at=now() where id=$1 and status in('pending','running')`, [tracked.id, JSON.stringify({ rotationRequestedAt: new Date().toISOString(), rotationReason: "github_runtime_window" })])
           }
         }
+        continue
+      }
+      // Direct-Neon workers heartbeat in the queue database, not in
+      // drive_agent_runs. Their queue heartbeat is the source of truth for
+      // capacity; the run row only records that GitHub accepted dispatch.
+      if (directQueueMode && activeQueueWorkerInstances.includes(instanceId)) {
+        agentOccupancy += 1
         continue
       }
       const heartbeatStale = Date.parse(String(tracked.updated_at || "")) < Date.now() - 3 * 60_000
@@ -2954,7 +2965,7 @@ async function cycle(env: Env) {
       const recovered = shards.inventoryPending || shards.queuePending || directQueueMode ? 0 : await recoverJobs(db, migration.id, shards.generation, shards.shardCount)
       const queueRecovery = directQueueMode && !shards.inventoryPending && !shards.queuePending && !shards.terminalFailure
         ? await recoverQueueFailedJobs(db, migration.id, shards.generation)
-        : { configured: directQueueMode, retried: 0 }
+        : { configured: directQueueMode, retried: 0, activeWorkerInstances: [] as string[] }
       await renew(db, owner)
       const finalized = shards.terminalFailure || shards.inventoryPending || shards.queuePending
         ? { complete: false, terminalFailure: Boolean(shards.terminalFailure), jobs: {} }
@@ -2986,7 +2997,10 @@ async function cycle(env: Env) {
       // partially scanned repair from looking like an active worker run.
       const inventoryReady = !shards.inventoryPending && !shards.queuePending && (!directQueueMode || queueSeed.complete)
       const hasRunnableFiles = shards.shardCount > 0 || shards.created > 0
-      const dispatched = current?.status === "running" && inventoryReady && hasRunnableFiles ? await dispatchWorkers(db, env, current) : 0
+      const activeQueueWorkerInstances = Array.isArray(queueRecovery.activeWorkerInstances) ? queueRecovery.activeWorkerInstances as string[] : []
+      const dispatched = current?.status === "running" && inventoryReady && hasRunnableFiles
+        ? await dispatchWorkers(db, env, current, activeQueueWorkerInstances)
+        : 0
       if (inventoryReady && hasRunnableFiles && current && ["running", "verifying"].includes(String(current.status))) {
         const verifying = finalized.complete
         await db.query(`update drive_migrations set sync_status=$2,sync_message=$3,last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [
