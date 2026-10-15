@@ -6,7 +6,7 @@ type Env = { POSTGRES_URL?: string; HYPERDRIVE?: { connectionString: string }; M
 // Database rows are dynamically shaped by the PostgreSQL queries below.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Row = Record<string, any>
-const BUILD = 44
+const BUILD = 46
 const MIN_QUEUE_BATCH_SIZE = 500
 const DEFAULT_QUEUE_BATCH_SIZE = 2_000
 const MAX_QUEUE_BATCH_SIZE = 4_000
@@ -1581,11 +1581,12 @@ async function seedMigrationQueue(db: Client, migrationId: string, generation: n
   const queue = new Client({ connectionString: parsed.toString(), ssl: ["disable"].includes(sslMode || "") || ["localhost", "127.0.0.1"].includes(parsed.hostname) ? false : { rejectUnauthorized: false }, connectionTimeoutMillis: 8_000, keepAlive: true, application_name: "drive-migration-orchestrator-seed" })
   await queue.connect()
   try {
-    // Seed one bounded page per Orchestrator cycle. The cursor commits with the
+    // Seed one adaptive page per Orchestrator cycle. The cursor commits with
     // queue rows, so a crash replays at most this page and ON CONFLICT is safe.
-    // Keep JS row decoding/mapping below the 10 ms CPU budget; the entire
-    // queue is still consumed continuously through durable cursor pages.
-    const limit = 500
+    // Keep the JS mapping bounded for the 10 ms CPU budget while growing fast
+    // enough to avoid taking a minute per small page on large migrations.
+    const queueStartedAt = Date.now()
+    const limit = Math.max(MIN_QUEUE_BATCH_SIZE, Math.min(MAX_QUEUE_BATCH_SIZE, adaptiveQueueBatchSize))
     await queue.query("begin")
     await queue.query(`insert into drive_migration_queue_meta(migration_id,generation,status) values($1,$2,'seeding') on conflict(migration_id,generation) do nothing`, [migrationId, generation])
     const meta = (await queue.query(`select seed_cursor,seed_complete from drive_migration_queue_meta where migration_id=$1 and generation=$2 for update`, [migrationId, generation])).rows[0]
@@ -1639,8 +1640,9 @@ async function seedMigrationQueue(db: Client, migrationId: string, generation: n
     const complete = rows.length <= limit
     await queue.query(`update drive_migration_queue_meta set seed_cursor=$3,seed_complete=$4,status=case when $4 then 'ready' else 'seeding' end,total_jobs=(select count(*) from drive_migration_queue_jobs where migration_id=$1 and generation=$2),updated_at=now() where migration_id=$1 and generation=$2`, [migrationId, generation, `${last.seed_created_at}|${last.id}`, complete])
     await queue.query("commit")
+    tuneQueueBatchSize(Date.now() - queueStartedAt, true)
     return { configured: true, complete, inserted: page.length }
-  } catch (error) { await queue.query("rollback").catch(() => undefined); throw error }
+  } catch (error) { tuneQueueBatchSize(Number.MAX_SAFE_INTEGER, false); await queue.query("rollback").catch(() => undefined); throw error }
   finally { await queue.end().catch(() => undefined) }
 }
 
@@ -1869,7 +1871,13 @@ async function dispatchBackendWorkers(db: Client, env: Env, migration: Row) {
     pendingVerifications: Number(work.rows[0]?.verification_pending || 0),
     generation,
   }
-  if (!pendingTaskCount) return { dispatched: 0, reason: "no_pending_scan_or_verification_tasks", ...diagnostics }
+  if (!pendingTaskCount) {
+    const canceled = await db.query(`update drive_agent_runs set status='canceled',completed_at=now(),summary='No scan or verification work remained before this Backend Worker dispatch started',payload=payload||jsonb_build_object('phase','canceled_no_work','canceledAt',now()),updated_at=now()
+      where run_type='github_backend_dispatch' and status='pending' and payload->>'migrationId'=$1
+        and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$2
+        and coalesce(payload->>'phase','created') in('created','queued')`, [migration.id, generation])
+    return { dispatched: 0, canceledIntents: canceled.rowCount || 0, reason: "no_pending_scan_or_verification_tasks", ...diagnostics }
+  }
   const configuration = await db.query(`select key,value from drive_app_settings where key in('migration-orchestrator','migration-workers')`)
   const orchestration = configuration.rows.find((row) => row.key === "migration-orchestrator")?.value || {}
   const workerSettings = configuration.rows.find((row) => row.key === "migration-workers")?.value || {}
