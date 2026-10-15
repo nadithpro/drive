@@ -6,7 +6,7 @@ type Env = { POSTGRES_URL?: string; HYPERDRIVE?: { connectionString: string }; M
 // Database rows are dynamically shaped by the PostgreSQL queries below.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Row = Record<string, any>
-const BUILD = 46
+const BUILD = 47
 const MIN_QUEUE_BATCH_SIZE = 500
 const DEFAULT_QUEUE_BATCH_SIZE = 2_000
 const MAX_QUEUE_BATCH_SIZE = 4_000
@@ -498,7 +498,7 @@ async function ensureShards(db: Client, migration: Row) {
       ? opts(migration).workerRetryObjectKeysByItem as Row : {}
     selectedRetryKeys = opts(migration).workerRetryFailedObjectsOnly === true && Array.isArray(retryKeysMap[candidate.id])
       ? retryKeysMap[candidate.id] as string[] : null
-    if (Number(queueState.generation) === generation && queueState.status === "completed") {
+    if (Number(queueState.generation) === generation && String(queueState.materializationStatus || queueState.status) === "completed") {
       const coverage = await db.query(`select count(*)::int missing_count
         from drive_bucket_scan_objects o where o.scan_id=$4 and not o.is_dir_marker
           and ($5::text[] is null or o.key=any($5::text[]))
@@ -511,7 +511,8 @@ async function ensureShards(db: Client, migration: Row) {
       if (Number(coverage.rows[0]?.missing_count || 0) === 0) continue
       const attempts = Number(queueState.integrityRepairAttempts || 0)
       candidate.progress = { ...(candidate.progress || {}), migrationQueue: {
-        ...queueState, generation, status: "materializing", lastKey: "", materializedObjects: 0,
+        ...queueState, generation, status: queueState.totalJobs != null ? queueState.status : "materializing",
+        materializationStatus: "materializing", lastKey: "", materializedObjects: 0,
         totalObjects: Number(scan.objects || candidate.source_objects || 0),
         integrityRepairAttempts: attempts + 1, integrityRepairMissing: Number(coverage.rows[0]?.missing_count || 0),
         updatedAt: new Date().toISOString(),
@@ -580,7 +581,10 @@ async function ensureShards(db: Client, migration: Row) {
       const priorMaterialized = Number(queueItem.progress?.migrationQueue?.generation) === generation
         ? Number(queueItem.progress?.migrationQueue?.materializedObjects || 0)
         : 0
-      await db.query(`update drive_migration_items set progress=jsonb_set(coalesce(progress,'{}'::jsonb),'{migrationQueue}',$2::jsonb),updated_at=now() where id=$1`, [queueItem.id, JSON.stringify({ generation, status: completed ? "completed" : "materializing", lastKey: nextKey, materializedObjects: retryCoverage ? 0 : priorMaterialized + pageCount, totalObjects: Number(queueItem.source_objects || queueScan?.objects || 0), integrityRepairAttempts: integrityAttempts + (retryCoverage ? 1 : 0), integrityRepairMissing: retryCoverage ? missingCount : 0, updatedAt: new Date().toISOString() })])
+      const previousQueueStatus = queueItem.progress?.migrationQueue?.totalJobs != null
+        ? queueItem.progress.migrationQueue.status
+        : completed ? "completed" : "materializing"
+      await db.query(`update drive_migration_items set progress=jsonb_set(coalesce(progress,'{}'::jsonb),'{migrationQueue}',$2::jsonb),updated_at=now() where id=$1`, [queueItem.id, JSON.stringify({ ...priorQueue, generation, status: previousQueueStatus, materializationStatus: completed ? "completed" : "materializing", lastKey: nextKey, materializedObjects: retryCoverage ? 0 : priorMaterialized + pageCount, totalObjects: Number(queueItem.source_objects || queueScan?.objects || 0), integrityRepairAttempts: integrityAttempts + (retryCoverage ? 1 : 0), integrityRepairMissing: retryCoverage ? missingCount : 0, updatedAt: new Date().toISOString() })])
       await db.query("commit")
     } catch (error) {
       tuneQueueBatchSize(Number.MAX_SAFE_INTEGER, false)
