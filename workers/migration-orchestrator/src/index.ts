@@ -2,7 +2,7 @@ import { Client } from "pg"
 import { syncWorkerRepository } from "../../../src/lib/github-worker-sync"
 
 type DispatchMessage = { intentId: string } | { control: "cycle" }
-type Env = { POSTGRES_URL?: string; HYPERDRIVE?: { connectionString: string }; MIGRATION_ORCHESTRATOR_SECRET?: string; PANEL_URL?: string; DISABLE_POSTGRES_SSL?: string; GITHUB_WORKER_SOURCE_REPO?: string; GITHUB_DISPATCH_QUEUE: Queue<DispatchMessage> }
+type Env = { POSTGRES_URL?: string; HYPERDRIVE?: { connectionString: string }; MIGRATION_ORCHESTRATOR_SECRET?: string; PANEL_URL?: string; DISABLE_POSTGRES_SSL?: string; GITHUB_WORKER_SOURCE_REPO?: string; GITHUB_BACKEND_WORKER_SOURCE_REPO?: string; GITHUB_DISPATCH_QUEUE: Queue<DispatchMessage> }
 // Database rows are dynamically shaped by the PostgreSQL queries below.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Row = Record<string, any>
@@ -19,7 +19,7 @@ let schemaReady: Promise<void> | null = null
 const workerRepositorySyncs = new Map<string, ReturnType<typeof syncWorkerRepository>>()
 
 function syncWorkerRepositoryOnce(input: Parameters<typeof syncWorkerRepository>[0]) {
-  const key = [input.owner, input.repo, input.workflow, input.sourceRepo || "", input.activateActions ? "activate" : ""].join("/")
+  const key = [input.workerKind || "migration", input.owner, input.repo, input.workflow, input.sourceRepo || "", input.activateActions ? "activate" : ""].join("/")
   const existing = workerRepositorySyncs.get(key)
   if (existing) return existing
   const pending = syncWorkerRepository(input)
@@ -1668,7 +1668,7 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   // Every registered GitHub workflow contributes its configured capacity to
   // every active worker-pool migration. Re-read this set on every cycle so a
   // workflow registered mid-migration joins automatically.
-  const agents = await db.query(`select id,github_repo_owner,github_repo_name,github_workflow_file,github_ref,github_token,least(5,greatest(1,coalesce(worker_count,1))) worker_count from drive_agents where provider='github_actions' and status<>'disabled' and github_token is not null and github_repo_owner is not null and github_repo_name is not null and github_workflow_file is not null order by created_at,id`)
+  const agents = await db.query(`select id,github_repo_owner,github_repo_name,github_workflow_file,github_ref,github_token,least(5,greatest(1,coalesce(worker_count,1))) worker_count from drive_agents where provider='github_actions' and status<>'disabled' and capabilities @> '["bulk_migrate"]'::jsonb and github_token is not null and github_repo_owner is not null and github_repo_name is not null and github_workflow_file is not null order by created_at,id`)
   const githubRunsByWorkflow = new Map<string, Row[]>()
   const activeByWorkflow = new Map<string, Set<string>>()
   const blockedWorkflows = new Set<string>()
@@ -1821,6 +1821,80 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row) {
   return queued
 }
 
+async function dispatchBackendWorkers(db: Client, env: Env, migration: Row) {
+  const generation = integer(opts(migration).workerGeneration, 1, 1, 1000000)
+  const work = await db.query(`select
+    (select count(*)::int from drive_migration_items i join drive_migrations m on m.id=i.migration_id
+      join drive_bucket_scans s on s.id::text=i.progress->'migrationInventory'->>'sourceScanId'
+      where i.migration_id=$1 and m.options->>'executionMode'='migration_workers'
+        and coalesce(i.progress->'migrationInventory'->>'status','') not in('completed','failed')
+        and ((s.status='pending' and (s.attempt_count=0 or s.updated_at<=now()-make_interval(mins=>least(30,power(2,least(s.attempt_count,5))::int))))
+          or (s.status='running' and (s.lease_expires_at is null or s.lease_expires_at<now())))) inventory_pending,
+    (select count(*)::int from drive_migration_verification_state v join drive_migrations m on m.id=v.migration_id
+      join drive_migration_items i on i.id=v.migration_item_id
+      where v.migration_id=$1 and v.generation=$2 and m.status in('running','verifying')
+        and (v.status='pending' and (v.attempt_count=0 or v.updated_at<=now()-make_interval(mins=>least(30,power(2,least(v.attempt_count,5))::int)))
+          or v.status='running' and (v.lease_expires_at is null or v.lease_expires_at<now()))
+        and (m.options->>'executionMode' is distinct from 'migration_workers' or (
+          i.progress->'migrationInventory'->>'status'='completed' and i.progress->'migrationQueue'->>'status'='completed'
+          and not exists(select 1 from drive_repair_jobs j where j.migration_id=m.id
+            and j.work_key like format('migration:%s:generation:%s:inventory:%%',m.id,$2)
+            and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed')))) verification_pending`, [migration.id, generation])
+  const pendingTaskCount = Number(work.rows[0]?.inventory_pending || 0) + Number(work.rows[0]?.verification_pending || 0)
+  if (!pendingTaskCount) return 0
+  const configuration = await db.query(`select value from drive_app_settings where key in('migration-orchestrator','migration-workers')`)
+  const orchestration = configuration.rows.find((row) => row.key === "migration-orchestrator")?.value || {}
+  const workerSettings = configuration.rows.find((row) => row.key === "migration-workers")?.value || {}
+  if (!(await githubWorkerSecretsAreCurrent(orchestration, workerSettings))) return 0
+  if (!(await workerEndpointAvailable(db, migration.id, orchestration))) return 0
+  const activeRuns = await db.query(`select r.*,a.github_repo_owner,a.github_repo_name,a.github_workflow_file,a.github_ref,a.github_token
+    from drive_agent_runs r join drive_agents a on a.id=r.agent_id
+    where r.run_type='github_backend_dispatch' and r.status in('pending','running')
+      and r.payload->>'migrationId'=$1 and greatest(1,coalesce(nullif(r.payload->>'workerGeneration','')::int,1))=$2
+      and a.github_token is not null`, [migration.id, generation])
+  for (const run of activeRuns.rows) {
+    await reconcileGitHubIntent(db, run, run).catch((error) => console.warn("Backend Worker GitHub run reconciliation deferred", run.id, error instanceof Error ? error.message : String(error)))
+  }
+  const stranded = await db.query(`select id from drive_agent_runs where run_type='github_backend_dispatch' and status='pending'
+    and payload->>'migrationId'=$1 and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$2
+    and coalesce(payload->>'phase','created') in('created','queued') order by created_at limit 10`, [migration.id, generation])
+  for (const run of stranded.rows) await env.GITHUB_DISPATCH_QUEUE.send({ intentId: String(run.id) }, { contentType: "json" })
+  const agents = await db.query(`select id,github_repo_owner,github_repo_name,github_workflow_file,github_ref,github_token,
+      least(5,greatest(1,coalesce(worker_count,1))) worker_count
+    from drive_agents where provider='github_actions' and status<>'disabled'
+      and capabilities @> '["scan","verify"]'::jsonb and not capabilities @> '["bulk_migrate"]'::jsonb
+      and metadata->>'workerKind'='backend'
+      and github_token is not null and github_repo_owner is not null and github_repo_name is not null
+      and github_workflow_file is not null order by created_at,id`)
+  const totalActive = await db.query(`select count(*)::int count from drive_agent_runs r join drive_agents a on a.id=r.agent_id
+    where r.run_type='github_backend_dispatch' and r.status in('pending','running')
+      and r.payload->>'migrationId'=$1 and greatest(1,coalesce(nullif(r.payload->>'workerGeneration','')::int,1))=$2
+      and a.metadata->>'workerKind'='backend'`, [migration.id, generation])
+  let remainingDemand = Math.max(0, pendingTaskCount - Number(totalActive.rows[0]?.count || 0))
+  let dispatched = 0
+  for (const agent of agents.rows) {
+    const active = await db.query(`select count(*)::int count from drive_agent_runs
+      where agent_id=$1 and run_type='github_backend_dispatch' and status in('pending','running')
+        and payload->>'migrationId'=$2 and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$3`, [agent.id, migration.id, generation])
+    const activeCount = Number(active.rows[0]?.count || 0)
+    const vacancies = Math.max(0, Math.min(5, Number(agent.worker_count || 1)) - activeCount)
+    const needed = Math.min(vacancies, remainingDemand)
+    remainingDemand -= needed
+    for (let slot = 0; slot < needed; slot += 1) {
+      const workerInstanceId = crypto.randomUUID()
+      const intent = await db.query(`insert into drive_agent_runs(id,agent_id,run_type,status,payload,summary,created_at,updated_at)
+        select gen_random_uuid(),$1,'github_backend_dispatch','pending',$2::jsonb,'Backend Worker dispatch queued',now(),now()
+        where exists(select 1 from drive_migrations where id=$3 and status in('running','verifying')
+          and greatest(1,coalesce(nullif(options->>'workerGeneration','')::int,1))=$4) returning id`,
+        [agent.id, JSON.stringify({ migrationId: migration.id, workerGeneration: generation, pool: true, workerType: "backend", workerInstanceId, source: "migration_orchestrator", phase: "created" }), migration.id, generation])
+      if (!intent.rows[0]) break
+      await env.GITHUB_DISPATCH_QUEUE.send({ intentId: String(intent.rows[0].id) }, { contentType: "json" })
+      dispatched += 1
+    }
+  }
+  return dispatched
+}
+
 async function abortMigrationWorkers(db: Client, migrationId: string, reason: string) {
   const result = await db.query(`
     select r.id,r.status,r.external_run_id,r.payload,a.github_repo_owner,a.github_repo_name,a.github_workflow_file,a.github_ref,a.github_token
@@ -1929,7 +2003,7 @@ async function reconcileOrphanedGitHubDispatches(db: Client) {
     select r.payload->>'migrationId' migration_id,min(r.updated_at) oldest_updated_at
     from drive_agent_runs r
     join drive_agents a on a.id=r.agent_id and a.provider='github_actions' and a.github_token is not null
-    where r.run_type='github_dispatch' and r.status in('pending','running')
+    where r.run_type in('github_dispatch','github_backend_dispatch') and r.status in('pending','running')
       and nullif(r.payload->>'migrationId','') is not null
       and not exists(
         select 1 from drive_migrations m
@@ -1948,8 +2022,10 @@ async function reconcileOrphanedGitHubDispatches(db: Client) {
       set payload=payload||jsonb_build_object('githubAbortRequestedAt',coalesce(payload->>'githubAbortRequestedAt',now()::text)),
         summary=case when payload->>'githubAbortRequestedAt' is null then 'Migration is missing or terminal; stopping orphaned GitHub worker' else summary end,
         updated_at=now()
-      where run_type='github_dispatch' and status in('pending','running') and payload->>'migrationId'=$1
+      where run_type in('github_dispatch','github_backend_dispatch') and status in('pending','running') and payload->>'migrationId'=$1
     `, [migrationId])
+    await db.query(`update drive_agent_runs set status='canceled',summary='Migration is missing or terminal; Backend Worker dispatch stopped',completed_at=now(),updated_at=now()
+      where run_type='github_backend_dispatch' and status in('pending','running') and payload->>'migrationId'=$1`, [migrationId])
     const shutdown = await abortMigrationWorkers(db, migrationId, `Migration ${migrationId} is missing or terminal; stopping orphaned GitHub workers`)
     results.push({ migrationId, ...shutdown })
   }
@@ -2021,13 +2097,15 @@ async function consumeDispatch(env: Env, intentId: string, attempts: number) {
       return "terminal"
     }
     const workerInstanceId = String(intent.payload.workerInstanceId)
-    const codeSync = await syncWorkerRepositoryOnce({ token: intent.github_token, owner: intent.github_repo_owner, repo: intent.github_repo_name, workflow: intent.github_workflow_file || ".github/workflows/migration-worker.yml", sourceRepo: env.GITHUB_WORKER_SOURCE_REPO, activateActions: intent.agent_status === "dispatch_ready" })
+    const workerKind = intent.run_type === "github_backend_dispatch" ? "backend" : "migration"
+    const workerWorkflow = intent.github_workflow_file || (workerKind === "backend" ? ".github/workflows/backend-worker.yml" : ".github/workflows/migration-worker.yml")
+    const codeSync = await syncWorkerRepositoryOnce({ token: intent.github_token, owner: intent.github_repo_owner, repo: intent.github_repo_name, workflow: workerWorkflow, sourceRepo: workerKind === "backend" ? env.GITHUB_BACKEND_WORKER_SOURCE_REPO || env.GITHUB_WORKER_SOURCE_REPO : env.GITHUB_WORKER_SOURCE_REPO, activateActions: intent.agent_status === "dispatch_ready", workerKind })
     await db.query(`update drive_agents set github_ref=$2,updated_at=now() where id=$1`, [intent.agent_id, codeSync.defaultBranch])
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb where id=$1`, [intent.id, JSON.stringify({ sourceCommit: codeSync.sourceSha, workerCommit: codeSync.targetSha, ref: codeSync.defaultBranch })])
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb,summary='Submitting GitHub workflow dispatch',updated_at=now() where id=$1`, [intent.id, JSON.stringify({ phase: "dispatching", dispatchStartedAt: new Date().toISOString(), dispatchAttempt: attempts })])
     const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(intent.github_repo_owner)}/${encodeURIComponent(intent.github_repo_name)}/dispatches`, {
       method: "POST", headers: { Authorization: `Bearer ${intent.github_token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Drive-Migration-Orchestrator", "Content-Type": "application/json" },
-      body: JSON.stringify({ event_type: "drive-migration-worker", client_payload: { migration_id: intent.payload.migrationId, worker_generation: intent.payload.workerGeneration, agent_id: intent.agent_id, worker_instance_id: workerInstanceId, workflow_file: intent.github_workflow_file || ".github/workflows/migration-worker.yml", code_ref: codeSync.targetSha, max_runtime_seconds: GITHUB_WORKER_MAX_RUNTIME_SECONDS } }), signal: AbortSignal.timeout(20_000),
+      body: JSON.stringify({ event_type: workerKind === "backend" ? "drive-backend-worker" : "drive-migration-worker", client_payload: { migration_id: intent.payload.migrationId, worker_generation: intent.payload.workerGeneration, agent_id: intent.agent_id, worker_instance_id: workerInstanceId, workflow_file: workerWorkflow, code_ref: codeSync.targetSha, max_runtime_seconds: GITHUB_WORKER_MAX_RUNTIME_SECONDS } }), signal: AbortSignal.timeout(20_000),
     })
     if (!response.ok) throw new Error(`GitHub dispatch HTTP ${response.status}`)
     await db.query(`update drive_agent_runs set payload=payload||$2::jsonb,summary='GitHub accepted workflow dispatch; awaiting run reconciliation',updated_at=now() where id=$1`, [intent.id, JSON.stringify({ phase: "accepted", acceptedAt: new Date().toISOString() })])
@@ -2060,7 +2138,7 @@ async function complete(db: Client, owner: string, migrationId: string | null, r
 
 async function workerAuthorized(db: Client, agentId: string, token: unknown): Promise<Row | null> {
   if (typeof token !== "string" || token.length < 24 || token.length > MAX_SECRET_LENGTH) return null
-  const result = await db.query(`select id,name,status,capabilities from drive_agents where id=$1 limit 1`, [agentId])
+  const result = await db.query(`select id,name,status,capabilities,metadata from drive_agents where id=$1 limit 1`, [agentId])
   const agent = result.rows[0]
   if (!agent || agent.status === "disabled") return null
   const settings = await db.query(`select value from drive_app_settings where key='migration-workers' limit 1`)
@@ -2099,6 +2177,287 @@ async function workerPayload(db: Client, job: Row) {
     target: { accountId: target.cloudflare_account_id, accessKeyId: target.r2_access_key_id, secretAccessKey: target.r2_secret_access_key },
     items: selected.map((item) => ({ id: item.id, sourceBucket: item.source_bucket, targetBucket: item.target_bucket, sourceObjects: Number(item.source_objects || 0), sourceBytes: Number(item.source_bytes || 0), slurperStatus: item.slurper_status, progress: item.progress || {} })),
   }
+}
+
+async function claimBackendTask(db: Client, agent: Row, migrationId: string, generation: number, instanceId: string) {
+  const owner = `${agent.id}:${instanceId}`
+  const claimed = await db.query(`with candidate as (
+      select s.id,s.migration_id,s.migration_item_id,s.account_id,s.bucket_name,s.prefix,s.cursor,s.last_key,
+        a.cloudflare_account_id,a.r2_access_key_id,a.r2_secret_access_key,
+        coalesce(bs.jurisdiction,'default') jurisdiction,
+        m.options->>'pathPrefix' migration_prefix,i.target_bucket
+      from drive_bucket_scans s
+      join drive_migrations m on m.id=s.migration_id
+      join drive_migration_items i on i.id=s.migration_item_id and i.migration_id=m.id
+      join drive_accounts a on a.id=s.account_id
+      left join drive_bucket_settings_snapshots bs on bs.account_id=s.account_id and bs.bucket_name=s.bucket_name
+      where s.migration_id=$1 and s.kind='source' and s.status in('pending','running')
+        and ((s.status='pending' and (s.attempt_count=0 or s.updated_at<=now()-make_interval(mins=>least(30,power(2,least(s.attempt_count,5))::int))))
+          or (s.status='running' and (s.lease_expires_at is null or s.lease_expires_at<now())))
+        and m.status in('running','verifying')
+        and greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1))=$2
+        and i.progress->'migrationInventory'->>'sourceScanId'=s.id::text
+        and coalesce(i.progress->'migrationInventory'->>'status','') not in('completed','failed')
+      order by s.updated_at,s.id for update of s skip locked limit 1
+    ), leased as (
+      update drive_bucket_scans s set status='running',lease_owner=$3,lease_expires_at=now()+interval '90 seconds',started_at=coalesce(started_at,now()),updated_at=now()
+      from candidate c where s.id=c.id returning s.id,s.cursor,s.last_key
+    ) select c.*,l.id scan_id,l.cursor scan_cursor,l.last_key scan_last_key from candidate c join leased l on l.id=c.id`, [migrationId, generation, owner])
+  const task = claimed.rows[0]
+  if (!task) {
+    await db.query("begin")
+    try {
+      const verification = await db.query(`select v.*,i.source_bucket,i.target_bucket,i.source_jurisdiction,
+          coalesce(target_settings.jurisdiction,i.source_jurisdiction,'default') target_jurisdiction,
+          m.source_account_id,m.target_account_id,m.options,m.status migration_status,
+          greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1)) current_generation,
+          sa.cloudflare_account_id source_cloudflare_account_id,sa.r2_access_key_id source_key,sa.r2_secret_access_key source_secret,
+          ta.cloudflare_account_id target_cloudflare_account_id,ta.r2_access_key_id target_key,ta.r2_secret_access_key target_secret
+        from drive_migration_verification_state v join drive_migrations m on m.id=v.migration_id
+        join drive_migration_items i on i.id=v.migration_item_id
+        join drive_accounts sa on sa.id=m.source_account_id join drive_accounts ta on ta.id=m.target_account_id
+        left join drive_bucket_settings_snapshots target_settings on target_settings.account_id=m.target_account_id and target_settings.bucket_name=i.target_bucket
+        where v.migration_id=$1 and v.generation=$2 and m.status in('running','verifying')
+          and (v.status='pending' or (v.status='running' and (v.lease_expires_at is null or v.lease_expires_at<now())))
+          and (v.attempt_count=0 or v.updated_at<=now()-make_interval(mins=>least(30,power(2,least(v.attempt_count,5))::int)))
+          and (m.options->>'executionMode' is distinct from 'migration_workers' or (
+            i.progress->'migrationInventory'->>'status'='completed' and i.progress->'migrationQueue'->>'status'='completed'
+            and not exists(select 1 from drive_repair_jobs j where j.migration_id=m.id
+              and j.work_key like format('migration:%s:generation:%s:inventory:%%',m.id,$2)
+              and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed')))
+        order by v.updated_at for update of v skip locked limit 1`, [migrationId, generation])
+      const state = verification.rows[0]
+      if (!state) {
+        await db.query("commit")
+        return json({ task: null, retryAfterMs: 5000 })
+      }
+      const leased = await db.query(`update drive_migration_verification_state set status='running',lease_owner=$2,
+          lease_expires_at=now()+interval '90 seconds',updated_at=now()
+        where migration_item_id=$1 and generation=$3 returning *`, [state.migration_item_id, owner, generation])
+      if (!leased.rowCount) { await db.query("commit"); return json({ task: null, retryAfterMs: 2000 }) }
+      const phase = String(state.phase || "source")
+      let scanId = phase === "source" ? state.source_scan_id : state.destination_scan_id
+      if (phase !== "compare" && !scanId) {
+        const isSource = phase === "source"
+        const created = await db.query(`insert into drive_bucket_scans(id,account_id,bucket_name,kind,migration_id,migration_item_id,status,lease_owner,lease_expires_at,started_at,updated_at)
+          values(gen_random_uuid(),$1,$2,$3,$4,$5,'running',$6,now()+interval '90 seconds',now(),now()) returning id`, [isSource ? state.source_account_id : state.target_account_id, isSource ? state.source_bucket : state.target_bucket, isSource ? "source" : "dest", migrationId, state.migration_item_id, owner])
+        scanId = created.rows[0]?.id
+        const column = isSource ? "source_scan_id" : "destination_scan_id"
+        await db.query(`update drive_migration_verification_state set ${column}=$3,updated_at=now() where migration_item_id=$1 and generation=$2 and lease_owner=$4`, [state.migration_item_id, generation, scanId, owner])
+      }
+      if (phase === "compare") {
+        await db.query("commit")
+        return completeBackendVerification(db, { ...state, ...leased.rows[0], lease_owner: owner, migration_id: migrationId, execution_mode: state.options?.executionMode, overwrite: state.options?.overwrite !== false })
+      }
+      const scan = await db.query(`select cursor,last_key from drive_bucket_scans where id=$1 and migration_id=$2 and migration_item_id=$3`, [scanId, migrationId, state.migration_item_id])
+      await db.query(`update drive_bucket_scans set lease_owner=$2,lease_expires_at=now()+interval '90 seconds',status='running',updated_at=now() where id=$1`, [scanId, owner])
+      await db.query("commit")
+      return json({ task: {
+        id: scanId, itemId: state.migration_item_id, generation, leaseToken: owner, verificationItemId: state.migration_item_id,
+        phase, sourceBucket: state.source_bucket, targetBucket: state.target_bucket,
+        cursor: phase === "source" ? state.source_cursor : state.destination_cursor,
+        lastKey: scan.rows[0]?.last_key || null, prefix: state.options?.pathPrefix || null,
+        jurisdiction: phase === "source" ? state.source_jurisdiction || "default" : state.target_jurisdiction,
+        sourceAccount: { cloudflareAccountId: state.source_cloudflare_account_id, accessKeyId: state.source_key, secretAccessKey: state.source_secret },
+        targetAccount: { cloudflareAccountId: state.target_cloudflare_account_id, accessKeyId: state.target_key, secretAccessKey: state.target_secret },
+      } })
+    } catch (error) { await db.query("rollback").catch(() => undefined); throw error }
+  }
+  return json({ task: {
+    id: task.scan_id,
+    migrationId: task.migration_id,
+    itemId: task.migration_item_id,
+    generation,
+    leaseToken: owner,
+    phase: "source",
+    sourceBucket: task.bucket_name,
+    targetBucket: task.target_bucket,
+    cursor: task.scan_cursor,
+    lastKey: task.scan_last_key,
+    prefix: task.migration_prefix || task.prefix || null,
+    jurisdiction: task.jurisdiction,
+    sourceAccount: { cloudflareAccountId: task.cloudflare_account_id, accessKeyId: task.r2_access_key_id, secretAccessKey: task.r2_secret_access_key },
+  } })
+}
+
+async function completeBackendVerification(db: Client, task: Row) {
+  await db.query("begin")
+  try {
+    const result = await db.query(`with guard as (
+        select migration_item_id from drive_migration_verification_state
+        where migration_item_id=$1::uuid and generation=$2::int and lease_owner=$3::text for update
+      ), cleared as (
+        delete from drive_bucket_verify_diffs d using guard g where d.migration_item_id=g.migration_item_id returning d.id
+      ), source_diffs as (
+        insert into drive_bucket_verify_diffs(id,migration_item_id,source_scan_id,dest_scan_id,kind,key,source_size,dest_size)
+        select gen_random_uuid(),$1::uuid,$4::uuid,$5::uuid,case when d.key is null then 'missing' else 'size_mismatch' end,s.key,s.size,d.size
+        from drive_bucket_scan_objects s left join drive_bucket_scan_objects d on d.scan_id=$5::uuid and d.key=s.key
+        where s.scan_id=$4::uuid and not s.is_dir_marker and (
+          d.key is null or ($8::boolean and (d.size<>s.size or
+          (trim(both '"' from coalesce(s.etag,'')) ~ '^[0-9a-fA-F]{32}$' and trim(both '"' from coalesce(d.etag,'')) ~ '^[0-9a-fA-F]{32}$' and trim(both '"' from s.etag)<>trim(both '"' from d.etag)) or
+          ($6='migration_workers' and not exists(select 1 from drive_repair_jobs j where j.migration_id=$7::uuid and j.status='completed'
+            and j.payload->>'workerGeneration'=$2::text and j.payload->'itemIds'->>0=$1::text
+            and j.payload->'inventoryObjects'->0->>'key'=s.key
+            and trim(both '"' from coalesce(j.payload->'inventoryObjects'->0->>'etag',''))=trim(both '"' from coalesce(s.etag,''))
+            and j.result->'items'->0->'integrityProofs'->0->>'key'=s.key
+            and j.result->'items'->0->'integrityProofs'->0->>'verified'='true'
+            and j.result->'items'->0->'integrityProofs'->0->>'sha256' ~ '^[0-9a-f]{64}$'
+            and trim(both '"' from coalesce(j.result->'items'->0->'integrityProofs'->0->>'destinationEtag',''))=trim(both '"' from coalesce(d.etag,''))
+          )))
+        )) returning kind
+      ), extra_diffs as (
+        insert into drive_bucket_verify_diffs(id,migration_item_id,source_scan_id,dest_scan_id,kind,key,source_size,dest_size)
+        select gen_random_uuid(),$1::uuid,$4::uuid,$5::uuid,'extra',d.key,null,d.size from drive_bucket_scan_objects d
+        left join drive_bucket_scan_objects s on s.scan_id=$4::uuid and s.key=d.key and not s.is_dir_marker
+        where d.scan_id=$5::uuid and not d.is_dir_marker and s.key is null returning kind
+      ), counts as (
+        select count(*) filter(where kind='missing')::int missing,count(*) filter(where kind='size_mismatch')::int mismatched,
+          count(*) filter(where kind='extra')::int extra from (select kind from source_diffs union all select kind from extra_diffs) x
+      ), state_done as (
+        update drive_migration_verification_state v set status='completed',phase='complete',missing_objects=c.missing,
+          mismatched_objects=c.mismatched,extra_objects=c.extra,attempt_count=0,last_error=null,lease_owner=null,
+          lease_expires_at=null,completed_at=now(),updated_at=now()
+        from counts c where v.migration_item_id=$1::uuid and v.generation=$2::int and v.lease_owner=$3::text
+        returning c.missing,c.mismatched,c.extra
+      ), item_done as (
+        update drive_migration_items i set last_progress_at=now(),updated_at=now(),progress=jsonb_set(jsonb_set(coalesce(i.progress,'{}'::jsonb),'{fileVerification}',
+          jsonb_build_object('status','completed','missing',(select missing from state_done),'mismatched',(select mismatched from state_done),'extra',(select extra from state_done),'generation',$2::int,'completedAt',now())),
+          '{stage}','"file_verification_completed"'::jsonb,true)
+        from state_done where i.id=$1::uuid returning i.id
+      ) select * from state_done`,
+    [task.migration_item_id, task.generation, task.lease_owner, task.source_scan_id, task.destination_scan_id,
+      task.execution_mode || null, task.migration_id, task.overwrite !== false])
+    if (!result.rowCount) throw new Error("Backend Worker verification lease was lost")
+    await db.query("commit")
+    return json({ task: null, verification: { status: "completed", missing: Number(result.rows[0].missing), mismatched: Number(result.rows[0].mismatched), extra: Number(result.rows[0].extra) }, worked: true })
+  } catch (error) { await db.query("rollback").catch(() => undefined); throw error }
+}
+
+async function persistBackendPage(db: Client, body: Row) {
+  const scanId = String(body.taskId || "")
+  const leaseToken = String(body.leaseToken || "")
+  const migrationId = String(body.migrationId || "")
+  const generation = integer(body.generation, 0, 1, 1000000)
+  const objects = Array.isArray(body.objects) ? body.objects : null
+  if (!/^[0-9a-f-]{36}$/i.test(scanId) || !/^[0-9a-f-]{36}$/i.test(migrationId) || !leaseToken || !objects || objects.length > 1000) return json({ error: "Backend Worker page is invalid" }, 400)
+  if (typeof body.verificationItemId === "string") return persistBackendVerificationPage(db, body, normalizedBackendObjects(objects))
+  const normalized = normalizedBackendObjects(objects)
+  if (normalized.length !== objects.length) return json({ error: "Backend Worker page contains an invalid object key" }, 400)
+  const truncated = body.truncated === true
+  const cursor = truncated && typeof body.cursor === "string" && body.cursor ? body.cursor : null
+  if (truncated && !cursor) return json({ error: "Truncated backend scan page has no continuation cursor" }, 400)
+  const lastKey = typeof body.lastKey === "string" ? body.lastKey : normalized.at(-1)?.key || null
+  await db.query("begin")
+  try {
+    const saved = await db.query(`with lease as (
+        select s.id,s.migration_id,s.migration_item_id from drive_bucket_scans s
+        join drive_migrations m on m.id=s.migration_id
+        where s.id=$1::uuid and s.migration_id=$2::uuid and s.lease_owner=$3
+          and s.lease_expires_at>now() and m.status in('running','verifying')
+          and greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1))=$4
+        for update of s
+      ), incoming as (
+        select x.key,x.size,x.is_dir_marker,x.etag,x.last_modified
+        from jsonb_to_recordset($5::jsonb) as x(key text,size bigint,is_dir_marker boolean,etag text,last_modified timestamptz)
+      ), previous as (
+        select o.key,o.size,o.is_dir_marker from drive_bucket_scan_objects o join incoming i on i.key=o.key
+        where o.scan_id=$1::uuid
+      ), delta as (
+        select coalesce(sum((case when i.is_dir_marker then 0 else 1 end)-(case when p.key is not null and not p.is_dir_marker then 1 else 0 end)),0)::bigint object_delta,
+          coalesce(sum((case when i.is_dir_marker then 0 else i.size end)-(case when p.key is not null and not p.is_dir_marker then p.size else 0 end)),0)::bigint byte_delta
+        from incoming i left join previous p on p.key=i.key
+      ), upserted as (
+        insert into drive_bucket_scan_objects(scan_id,key,size,is_dir_marker,etag,last_modified)
+        select $1::uuid,key,size,is_dir_marker,etag,last_modified from incoming where exists(select 1 from lease)
+        on conflict(scan_id,key) do update set size=excluded.size,is_dir_marker=excluded.is_dir_marker,etag=excluded.etag,last_modified=excluded.last_modified
+        returning key
+      ), saved_scan as (
+        update drive_bucket_scans s set cursor=$6,last_key=$7,status=case when $8 then 'pending' else 'completed' end,
+          objects=greatest(0,coalesce(s.objects,0)+d.object_delta),bytes=greatest(0,coalesce(s.bytes,0)+d.byte_delta),
+          error=null,attempt_count=0,lease_owner=null,lease_expires_at=null,
+          completed_at=case when $8 then null else now() end,updated_at=now()
+        from delta d,(select count(*) from upserted) writes,lease l where s.id=l.id returning s.id,s.migration_id,s.migration_item_id,s.objects,s.bytes,s.status
+      ), saved_item as (
+        update drive_migration_items i set source_objects=s.objects,source_bytes=s.bytes,last_progress_at=now(),updated_at=now(),
+          progress=jsonb_set(coalesce(i.progress,'{}'::jsonb),'{migrationInventory}',
+            coalesce(i.progress->'migrationInventory','{}'::jsonb)||jsonb_build_object('status',case when s.status='completed' then 'completed' else 'scanning' end,
+              'objects',s.objects,'bytes',s.bytes,'lastKey',$7::text,'updatedAt',now(),'completedAt',case when s.status='completed' then now() else null end))
+        from saved_scan s where i.id=s.migration_item_id and i.migration_id=s.migration_id returning i.id
+      ) select s.*,exists(select 1 from saved_item) item_updated from saved_scan s`,
+    [scanId, migrationId, leaseToken, generation, JSON.stringify(normalized), cursor, lastKey, truncated])
+    if (!saved.rowCount) {
+      await db.query("rollback")
+      return json({ error: "Backend scan lease expired or was superseded" }, 409)
+    }
+    await db.query("commit")
+    return json({ ok: true, scanId, status: saved.rows[0].status, objects: Number(saved.rows[0].objects || 0), bytes: Number(saved.rows[0].bytes || 0), continued: truncated })
+  } catch (error) {
+    await db.query("rollback").catch(() => undefined)
+    throw error
+  }
+}
+
+function normalizedBackendObjects(objects: Row[]) {
+  return objects.map((entry: Row) => ({
+    key: typeof entry?.key === "string" ? entry.key : "",
+    size: Math.max(0, Math.trunc(Number(entry?.size) || 0)),
+    is_dir_marker: entry?.isDirectoryMarker === true,
+    etag: typeof entry?.etag === "string" ? entry.etag.slice(0, 512) : null,
+    last_modified: typeof entry?.lastModified === "string" && Number.isFinite(Date.parse(entry.lastModified)) ? new Date(entry.lastModified).toISOString() : null,
+  })).filter((entry) => entry.key.length > 0 && entry.key.length <= 2048)
+}
+
+async function persistBackendVerificationPage(db: Client, body: Row, objects: Row[]) {
+  const scanId = String(body.taskId || "")
+  const itemId = String(body.verificationItemId || "")
+  const leaseToken = String(body.leaseToken || "")
+  const migrationId = String(body.migrationId || "")
+  const generation = integer(body.generation, 0, 1, 1000000)
+  const phase = body.phase === "destination" ? "destination" : body.phase === "source" ? "source" : ""
+  if (!phase || !/^[0-9a-f-]{36}$/i.test(scanId) || !/^[0-9a-f-]{36}$/i.test(itemId) || objects.length !== (Array.isArray(body.objects) ? body.objects.length : -1)) return json({ error: "Backend Worker verification page is invalid" }, 400)
+  const truncated = body.truncated === true
+  const cursor = truncated && typeof body.cursor === "string" ? body.cursor : null
+  if (truncated && !cursor) return json({ error: "Truncated verification page has no continuation cursor" }, 400)
+  const cursorColumn = phase === "source" ? "source_cursor" : "destination_cursor"
+  const objectColumn = phase === "source" ? "source_objects" : "destination_objects"
+  const byteColumn = phase === "source" ? "source_bytes" : "destination_bytes"
+  const nextPhase = truncated ? phase : phase === "source" ? "destination" : "compare"
+  await db.query("begin")
+  try {
+    const result = await db.query(`with lease as (
+        select v.migration_item_id from drive_migration_verification_state v join drive_migrations m on m.id=v.migration_id
+        where v.migration_item_id=$2::uuid and v.migration_id=$3::uuid and v.generation=$4 and v.lease_owner=$5
+          and v.lease_expires_at>now() and v.phase=$6 and m.status in('running','verifying')
+          and greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1))=$4 for update of v
+      ), incoming as (
+        select x.key,x.size,x.is_dir_marker,x.etag,x.last_modified from jsonb_to_recordset($7::jsonb) as x(key text,size bigint,is_dir_marker boolean,etag text,last_modified timestamptz)
+      ), previous as (
+        select o.key,o.size,o.is_dir_marker from drive_bucket_scan_objects o join incoming i on i.key=o.key where o.scan_id=$1::uuid
+      ), delta as (
+        select coalesce(sum((case when i.is_dir_marker then 0 else 1 end)-(case when p.key is not null and not p.is_dir_marker then 1 else 0 end)),0)::bigint object_delta,
+          coalesce(sum((case when i.is_dir_marker then 0 else i.size end)-(case when p.key is not null and not p.is_dir_marker then p.size else 0 end)),0)::bigint byte_delta
+        from incoming i left join previous p on p.key=i.key
+      ), upserted as (
+        insert into drive_bucket_scan_objects(scan_id,key,size,is_dir_marker,etag,last_modified)
+        select $1::uuid,key,size,is_dir_marker,etag,last_modified from incoming where exists(select 1 from lease)
+        on conflict(scan_id,key) do update set size=excluded.size,is_dir_marker=excluded.is_dir_marker,etag=excluded.etag,last_modified=excluded.last_modified returning key
+      ), saved_scan as (
+        update drive_bucket_scans s set cursor=$8,last_key=$9,status=case when $10 then 'running' else 'completed' end,
+          objects=greatest(0,coalesce(s.objects,0)+d.object_delta),bytes=greatest(0,coalesce(s.bytes,0)+d.byte_delta),error=null,
+          lease_owner=case when $10 then $5 else null end,lease_expires_at=case when $10 then now()+interval '90 seconds' else null end,
+          completed_at=case when $10 then null else now() end,updated_at=now()
+        from delta d,(select count(*) from upserted) writes,lease l where s.id=$1::uuid and exists(select 1 from lease) returning s.id
+      ), saved_state as (
+        update drive_migration_verification_state v set ${cursorColumn}=$8,
+          ${objectColumn}=greatest(0,coalesce(v.${objectColumn},0)+d.object_delta),${byteColumn}=greatest(0,coalesce(v.${byteColumn},0)+d.byte_delta),
+          phase=$11,status='pending',attempt_count=0,last_error=null,lease_owner=null,lease_expires_at=null,updated_at=now()
+        from delta d,saved_scan s where v.migration_item_id=$2::uuid and v.generation=$4 and v.lease_owner=$5 returning v.migration_item_id
+      ) select exists(select 1 from saved_state) advanced,(select object_delta from delta) object_delta,(select byte_delta from delta) byte_delta`,
+    [scanId, itemId, migrationId, generation, leaseToken, phase, JSON.stringify(objects), cursor, typeof body.lastKey === "string" ? body.lastKey : objects.at(-1)?.key || null, truncated, nextPhase])
+    if (result.rows[0]?.advanced !== true) { await db.query("rollback"); return json({ error: "Backend verification lease expired or was superseded" }, 409) }
+    await db.query("commit")
+    return json({ ok: true, taskId: itemId, phase, continued: truncated, nextPhase, pageObjects: objects.length })
+  } catch (error) { await db.query("rollback").catch(() => undefined); throw error }
 }
 
 async function workerRequest(request: Request, env: Env, path: string) {
@@ -2141,7 +2500,7 @@ async function workerRequest(request: Request, env: Env, path: string) {
       return json({ ok: true, agentId })
     })
   }
-  const match = /^\/workers\/([0-9a-f-]{36})(?:\/(heartbeat|retire|claim-job|bootstrap|jobs\/([0-9a-f-]{36})))?$/i.exec(path)
+  const match = /^\/workers\/([0-9a-f-]{36})(?:\/(heartbeat|retire|claim-job|bootstrap|backend-claim|backend-heartbeat|backend-page|backend-fail|backend-finish|jobs\/([0-9a-f-]{36})))?$/i.exec(path)
   if (!match) return json({ error: "Not found" }, 404)
   return database(env, async (db) => {
     const agent = await workerAuthorized(db, match[1], body.token)
@@ -2153,6 +2512,15 @@ async function workerRequest(request: Request, env: Env, path: string) {
       if (!migration || !["running", "verifying"].includes(String(migration.status))) return json({ error: "Migration is missing or no longer active" }, 409)
       const requestedGeneration = Number(body.generation || 0)
       if (Number.isInteger(requestedGeneration) && requestedGeneration > 0 && requestedGeneration !== Number(migration.generation)) return json({ error: "Worker generation has been superseded" }, 409)
+      if (body.workerType === "backend") {
+        if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || !agent.capabilities.includes("verify") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered as a scan and verification Backend Worker" }, 409)
+        const instanceId = String(body.instanceId || "")
+        const dispatched = await db.query(`select 1 from drive_agent_runs where agent_id=$1 and run_type='github_backend_dispatch'
+          and status in('pending','running') and payload->>'workerInstanceId'=$2 and payload->>'migrationId'=$3
+          and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$4 limit 1`, [agent.id, instanceId, migrationId, Number(migration.generation)])
+        if (!dispatched.rowCount) return json({ error: "Backend Worker dispatch was not found or is no longer active" }, 403)
+        return json({ ok: true, workerType: "backend", migrationId, generation: Number(migration.generation), databaseCredentialsProvided: false }, 200)
+      }
       if (!Array.isArray(agent.capabilities) || !agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered for migration pool work" }, 409)
       const settings = (await db.query(`select value from drive_app_settings where key='migration-workers' limit 1`)).rows[0]?.value || {}
       const queueDatabaseUrl = String(settings.queueDatabaseUrl || "").trim()
@@ -2161,6 +2529,94 @@ async function workerRequest(request: Request, env: Env, path: string) {
       try { parsed = new URL(queueDatabaseUrl) } catch { /* validated below */ }
       if (!parsed || !["postgres:", "postgresql:"].includes(parsed.protocol) || !parsed.hostname || !parsed.username || !parsed.password) return json({ error: "Migration queue database is not configured or is invalid" }, 503)
       return json({ ok: true, migrationId, generation: Number(migration.generation), queueDatabaseUrl, queueDatabaseSsl }, 200)
+    }
+    if (action === "backend-claim") {
+      if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || !agent.capabilities.includes("verify") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered as a scan and verification Backend Worker" }, 409)
+      const migrationId = typeof body.migrationId === "string" ? body.migrationId : ""
+      const generation = integer(body.generation, 0, 1, 1000000)
+      const instanceId = String(body.instanceId || "").trim()
+      if (!/^[0-9a-f-]{36}$/i.test(migrationId) || !/^[0-9a-f-]{36}$/i.test(instanceId)) return json({ error: "Backend Worker migration and instance IDs are invalid" }, 400)
+      const dispatched = await db.query(`select 1 from drive_agent_runs where agent_id=$1 and run_type='github_backend_dispatch'
+        and status in('pending','running') and payload->>'workerInstanceId'=$2 and payload->>'migrationId'=$3
+        and greatest(1,coalesce(nullif(payload->>'workerGeneration','')::int,1))=$4 limit 1`, [agent.id, instanceId, migrationId, generation])
+      if (!dispatched.rowCount) return json({ error: "Backend Worker dispatch was not found or is no longer active" }, 403)
+      const active = await db.query(`select status,greatest(1,coalesce(nullif(options->>'workerGeneration','')::int,1)) generation from drive_migrations where id=$1`, [migrationId])
+      const current = active.rows[0]
+      if (!current || !["running", "verifying"].includes(String(current.status))) return json({ migrationComplete: true, task: null })
+      if (Number(current.generation) !== generation) return json({ generationSuperseded: true, task: null }, 409)
+      await db.query(`update drive_agent_runs set status='running',updated_at=now(),summary='Backend Worker is scanning or verifying migration data'
+        where agent_id=$1 and run_type='github_backend_dispatch' and payload->>'workerInstanceId'=$2 and status in('pending','running')`, [agent.id, instanceId])
+      await db.query(`update drive_agents set status='online',last_heartbeat_at=now(),last_seen_host='github-actions-backend-worker',updated_at=now(),last_error=null where id=$1 and status<>'disabled'`, [agent.id])
+      return claimBackendTask(db, agent, migrationId, generation, instanceId)
+    }
+    if (action === "backend-heartbeat") {
+      if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered for Backend Worker scans" }, 409)
+      if (body.agentId !== agent.id || String(body.leaseToken || "") !== `${agent.id}:${String(body.instanceId || "")}`) return json({ error: "Backend Worker heartbeat does not match its lease" }, 403)
+      const taskId = String(body.taskId || "")
+      const generation = integer(body.generation, 0, 1, 1000000)
+      if (!/^[0-9a-f-]{36}$/i.test(taskId)) return json({ error: "Backend Worker task ID is invalid" }, 400)
+      if (typeof body.verificationItemId === "string") {
+        const renewed = await db.query(`with lease as (
+            update drive_migration_verification_state v set lease_expires_at=now()+interval '90 seconds',updated_at=now()
+            from drive_migrations m where v.migration_item_id=$1::uuid and v.migration_id=$2::uuid and v.generation=$3
+              and v.lease_owner=$4 and v.status='running' and v.lease_expires_at>now() and v.phase=$5
+              and m.id=v.migration_id and m.status in('running','verifying')
+              and greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1))=$3 returning v.migration_item_id
+          ), scan as (
+            update drive_bucket_scans s set lease_expires_at=now()+interval '90 seconds',updated_at=now()
+            where s.id=$6::uuid and s.migration_item_id=$1::uuid and s.migration_id=$2::uuid and s.lease_owner=$4
+              and s.status='running' and s.lease_expires_at>now() and exists(select 1 from lease) returning s.id
+          ) select exists(select 1 from lease) and exists(select 1 from scan) renewed`,
+        [body.verificationItemId, body.migrationId, generation, body.leaseToken, body.phase, taskId])
+        if (renewed.rows[0]?.renewed !== true) return json({ error: "Backend verification lease expired or was superseded" }, 409)
+      } else {
+        const renewed = await db.query(`update drive_bucket_scans s set lease_expires_at=now()+interval '90 seconds',updated_at=now()
+          from drive_migrations m where s.id=$1::uuid and s.migration_id=$2::uuid and s.lease_owner=$3 and s.status='running'
+            and s.lease_expires_at>now() and m.id=s.migration_id and m.status in('running','verifying')
+            and greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1))=$4 returning s.id`,
+        [taskId, body.migrationId, body.leaseToken, generation])
+        if (!renewed.rowCount) return json({ error: "Backend scan lease expired or was superseded" }, 409)
+      }
+      return json({ ok: true })
+    }
+    if (action === "backend-page") {
+      if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered for Backend Worker scans" }, 409)
+      if (body.agentId !== agent.id || String(body.leaseToken || "") !== `${agent.id}:${String(body.instanceId || "")}`) return json({ error: "Backend Worker page authorization does not match its lease" }, 403)
+      return persistBackendPage(db, body)
+    }
+    if (action === "backend-fail") {
+      if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered for Backend Worker scans" }, 409)
+      if (body.agentId !== agent.id || String(body.leaseToken || "") !== `${agent.id}:${String(body.instanceId || "")}`) return json({ error: "Backend Worker failure report does not match its lease" }, 403)
+      const taskId = String(body.taskId || "")
+      const leaseToken = String(body.leaseToken || "")
+      const message = String(body.error || "Backend Worker scan failed").slice(0, 2000)
+      const status = Number(body.errorStatus || 0)
+      const code = String(body.errorCode || "").toUpperCase()
+      const transient = [408, 425, 429].includes(status) || status >= 500
+        || /^(?:57P01|57P03|53300|08000|08001|08003|08004|08006|08007|40001|40P01|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EPIPE)$/.test(code)
+        || /connection terminated unexpectedly|connection reset|connection closed|server closed the connection unexpectedly|client has encountered a connection error|not queryable|socket hang up|econn(?:reset|refused)|etimedout|eai_again|enotfound|enetunreach|epipe|fetch failed|time(?:out|d out)|temporar(?:y|ily) unavailable|too many (?:requests|connections|clients)|slow down|throttl|\bHTTP (?:408|425|429|500|502|503|504)\b|\b(?:57P01|57P03|53300|08000|08001|08003|08004|08006|08007|40001|40P01)\b/i.test(message)
+      const failed = await db.query(`update drive_bucket_scans s set status=case when $5::boolean then 'pending' else 'failed' end,error=$3,attempt_count=attempt_count+1,lease_owner=null,lease_expires_at=null,updated_at=now()
+        where s.id=$1::uuid and s.lease_owner=$2 and exists(select 1 from drive_migrations m where m.id=s.migration_id and m.status in('running','verifying')
+          and greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1))=$4) returning s.migration_item_id,s.migration_id`,
+        [taskId, leaseToken, message, integer(body.generation, 0, 1, 1000000), transient])
+      if (!failed.rowCount) return json({ error: "Scan lease expired or was superseded" }, 409)
+      if (typeof body.verificationItemId === "string") await db.query(`update drive_migration_verification_state set status=case when $6::boolean then 'pending' else 'failed' end,phase=case when $4 in('source','destination') then $4 else phase end,
+          last_error=$3,attempt_count=attempt_count+1,lease_owner=null,lease_expires_at=null,updated_at=now()
+        where migration_item_id=$1::uuid and generation=$2 and lease_owner=$5`, [body.verificationItemId, integer(body.generation, 0, 1, 1000000), message, body.phase, leaseToken, transient])
+      await db.query(`update drive_migration_items i set progress=jsonb_set(coalesce(i.progress,'{}'::jsonb),'{migrationInventory}',coalesce(i.progress->'migrationInventory','{}'::jsonb)||jsonb_build_object('status',case when $4::boolean then 'scanning' else 'failed' end,'error',$2::text,'updatedAt',now(),'failedAt',case when $4::boolean then null else now() end)),updated_at=now()
+        where i.id=$1 and $3::text is null and exists(select 1 from drive_migrations m where m.id=i.migration_id and m.status in('running','verifying'))`, [failed.rows[0].migration_item_id, message, body.verificationItemId || null, transient])
+      return json({ ok: true })
+    }
+    if (action === "backend-finish") {
+      if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered as a Backend Worker" }, 409)
+      const instanceId = String(body.instanceId || "")
+      if (body.agentId !== agent.id || !/^[0-9a-f-]{36}$/i.test(instanceId)) return json({ error: "Backend Worker finish report does not match its dispatch" }, 403)
+      const finished = await db.query(`update drive_agent_runs set status=$3,summary=$4,completed_at=now(),updated_at=now()
+        where agent_id=$1 and run_type='github_backend_dispatch' and payload->>'workerInstanceId'=$2 and status in('pending','running') returning id`,
+        [agent.id, instanceId, body.failed === true ? "failed" : "completed", String(body.summary || (body.failed ? "Backend Worker stopped with an error" : "Backend Worker finished its assigned migration scan work")).slice(0, 1000)])
+      if (!finished.rowCount) return json({ ok: true, alreadyFinished: true })
+      await db.query(`update drive_agents set status='offline',updated_at=now() where id=$1 and status<>'disabled' and not exists(select 1 from drive_agent_runs where agent_id=$1 and run_type='github_backend_dispatch' and status in('pending','running'))`, [agent.id])
+      return json({ ok: true })
     }
     const now = new Date().toISOString()
     if (action === "register" || action === "heartbeat") {
@@ -2449,10 +2905,13 @@ async function cycle(env: Env) {
       const inventoryReady = !shards.inventoryPending && !shards.queuePending && (!directQueueMode || queueSeed.complete)
       const hasRunnableFiles = shards.shardCount > 0 || shards.created > 0
       const dispatched = current?.status === "running" && inventoryReady && hasRunnableFiles ? await dispatchWorkers(db, env, current) : 0
+      const backendDispatched = current && ["running", "verifying"].includes(String(current.status))
+        ? await dispatchBackendWorkers(db, env, current)
+        : 0
       await recordItemStageEvents(db, migration, shards.generation)
       if (shards.inventoryPending || shards.queuePending || (directQueueMode && (!queueSeed.complete || !queueMirror.complete))) await env.GITHUB_DISPATCH_QUEUE.send({ control: "cycle" })
       await db.query(`update drive_migrations set last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [migration.id])
-      return complete(db, owner, migration.id, { ok: true, migrationId, ...shards, migrationQueue: directQueueMode ? { seed: queueSeed, mirror: queueMirror, recovery: queueRecovery } : null, recovered, finalized, ...verification, bucketSettings, fileScanner, dispatched })
+      return complete(db, owner, migration.id, { ok: true, migrationId, ...shards, migrationQueue: directQueueMode ? { seed: queueSeed, mirror: queueMirror, recovery: queueRecovery } : null, recovered, finalized, ...verification, bucketSettings, fileScanner, dispatched, backendDispatched })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       await db.query(`update drive_migration_orchestrator_state set status='error',lease_owner=null,lease_expires_at=null,last_completed_at=now(),last_error=$1,last_migration_id=$2,last_result=$3::jsonb,updated_at=now() where id=true and lease_owner=$4`, [message, migrationId, JSON.stringify({ ok: false, error: message }), owner]).catch(() => undefined)

@@ -238,6 +238,7 @@ export async function createAgent(input: {
   githubRepositoryId?: string
   githubToken?: string
   workerCount?: number
+  workerKind?: "migration" | "backend"
   notes?: string
 }): Promise<{ agent: DriveAgent; registrationToken?: string }> {
   const name = input.name.trim()
@@ -264,7 +265,7 @@ export async function createAgent(input: {
     notes: input.notes?.trim() || null,
     registration_token: registrationToken ?? null,
     registration_token_hash: registrationToken ? hashRegistrationToken(registrationToken) : null,
-    metadata: {},
+    metadata: input.workerKind === "backend" ? { workerKind: "backend" } : {},
   }
 
   const { rows } = await queryDb<DriveAgentRow>(

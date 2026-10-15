@@ -5,9 +5,11 @@ import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { WorkerRepository } from "@/lib/github-worker-setup"
 
-export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
+export function GitHubWorkerSetup({ connected, onSelect, onBusy, workerKind = "migration", startLabel }: {
   connected: boolean
-  onSelect: (repo: WorkerRepository, workflow: string) => void
+  workerKind?: "migration" | "backend"
+  startLabel?: string
+  onSelect: (repo: WorkerRepository, workflow: string) => void | Promise<void>
   onBusy: (busy: boolean) => void
 }) {
   const [busy, setBusy] = React.useState(false)
@@ -34,11 +36,13 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
     try {
       const deadline = Date.now() + 5 * 60 * 1000
       while (Date.now() < deadline) {
-        const response = await fetch("/api/github/worker-setup", {
+        const setupPath = workerKind === "backend" ? "/api/github/backend-worker-setup" : "/api/github/worker-setup"
+        const response = await fetch(setupPath, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ cursor: cursor.current, selectedId }), signal: abort.signal,
         })
-        const result = await response.json().catch(() => null) as {
+        const responseText = await response.text()
+        let result: {
           status?: string
           cursor?: unknown
           message?: unknown
@@ -46,8 +50,16 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
           repo?: WorkerRepository
           workflow?: unknown
           candidates?: WorkerRepository[]
-        } | null
-        if (!result || typeof result !== "object") throw new Error("GitHub setup returned an invalid response. Retry to continue.")
+        } | null = null
+        try {
+          result = JSON.parse(responseText) as typeof result
+        } catch {
+          // Preserve the HTTP details below so HTML platform errors are actionable.
+        }
+        const contentType = response.headers.get("content-type")?.split(";")[0] || "unknown content type"
+        if (!result || typeof result !== "object") {
+          throw new Error(`GitHub setup returned an unexpected response (HTTP ${response.status}, ${contentType}). Retry; if it continues, check the deployment function logs.`)
+        }
         if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "GitHub setup failed. Retry to continue.")
         if (abort.signal.aborted) return
         setMessage(typeof result.message === "string" ? result.message : "Continuing GitHub setup...")
@@ -56,7 +68,7 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
         }
         if (result.status === "ready" && result.repo && typeof result.workflow === "string" && result.workflow) {
           cursor.current = undefined
-          onSelect(result.repo, result.workflow)
+          await onSelect(result.repo, result.workflow)
           return
         }
         if (result.status === "ready") throw new Error("GitHub setup did not return a repository workflow. Press start to retry.")
@@ -88,7 +100,7 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy }: {
   return <div className="md:col-span-2 flex flex-col gap-3">
     <p className="text-sm text-muted-foreground">Automatically find or create your worker repository, sync the latest code, and activate its workflow. Existing repositories are reused when you retry.</p>
     <div className="flex gap-2">
-      <Button type="button" disabled={!connected || busy} aria-busy={busy} onClick={() => void run()}>{busy ? "Starting..." : "start"}</Button>
+      <Button type="button" disabled={!connected || busy} aria-busy={busy} onClick={() => void run()}>{busy ? "Starting..." : startLabel || "start"}</Button>
     </div>
     {message && <p role="status" className="text-sm text-muted-foreground">{message}</p>}
     {candidates.length > 0 && <Select disabled={busy} onValueChange={(id) => void run(id)}>

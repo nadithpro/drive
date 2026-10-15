@@ -1,6 +1,6 @@
-import { isWorkerWorkflow } from "./github-worker-workflow"
+import { isWorkerWorkflow, type GitHubWorkerKind } from "./github-worker-workflow"
 
-const directory = "workers/migration-worker/"
+const directoryFor = (kind: GitHubWorkerKind) => kind === "backend" ? "workers/backend-worker/" : "workers/migration-worker/"
 export const DEFAULT_WORKER_SOURCE = "iamnadith/Drive"
 type Repository = { id: number; default_branch: string; archived?: boolean; disabled?: boolean; source?: { id: number }; parent?: { id: number } }
 type Entry = { path: string; mode: string; type: string; sha: string }
@@ -13,8 +13,10 @@ export class WorkerSyncPendingError extends Error {}
 
 // Runtime-neutral: both the panel and the queue consumer use this exact gate.
 export async function syncWorkerRepository(input: {
-  token: string; owner: string; repo: string; workflow: string; sourceRepo?: string; activateActions?: boolean
+  token: string; owner: string; repo: string; workflow: string; sourceRepo?: string; activateActions?: boolean; workerKind?: GitHubWorkerKind
 }) {
+  const workerKind = input.workerKind || "migration"
+  const directory = directoryFor(workerKind)
   const sourceName = input.sourceRepo?.trim() || DEFAULT_WORKER_SOURCE
   if (!/^[\w.-]+\/[\w.-]+$/.test(sourceName)) throw new Error("Invalid GITHUB_WORKER_SOURCE_REPO")
   if (!/^\.github\/workflows\/[^/]+\.ya?ml$/i.test(input.workflow)) throw new Error("Invalid saved worker workflow")
@@ -57,22 +59,26 @@ export async function syncWorkerRepository(input: {
     const sourceTree = await tree(sourcePath, sourceSha)
     let workflow = sourceTree.entries.find(e => e.path === input.workflow && e.type === "blob")
     if (!workflow) {
-      const marker = sourceTree.entries.find(e => e.path === ".drive-worker.json" && e.type === "blob")
+      const markerPath = workerKind === "backend" ? ".drive-backend-worker.json" : ".drive-worker.json"
+      const marker = sourceTree.entries.find(e => e.path === markerPath && e.type === "blob")
       if (!marker) throw new Error("Source repository has no worker workflow marker")
       const config = JSON.parse(await blobText(sourcePath, marker.sha)) as { workflow?: string }
       workflow = sourceTree.entries.find(e => e.path === config.workflow && e.type === "blob")
       if (!workflow && config.workflow === "auto") {
         const compatible: Entry[] = []
         for (const entry of sourceTree.entries.filter(e => e.type === "blob" && /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(e.path))) {
-          if (isWorkerWorkflow(await blobText(sourcePath, entry.sha))) compatible.push(entry)
+          if (isWorkerWorkflow(await blobText(sourcePath, entry.sha), workerKind)) compatible.push(entry)
         }
         if (compatible.length !== 1) throw new Error("Source has multiple or no compatible worker workflows; select a source workflow explicitly")
         workflow = compatible[0]
       }
     }
-    if (!workflow || !isWorkerWorkflow(await blobText(sourcePath, workflow.sha))) throw new Error("Source worker workflow is missing or incompatible")
+    if (!workflow || !isWorkerWorkflow(await blobText(sourcePath, workflow.sha), workerKind)) throw new Error("Source worker workflow is missing or incompatible")
     const wanted = sourceTree.entries.filter(e => e.path.startsWith(directory) && e.type !== "tree")
-    for (const name of ["package.json", "package-lock.json", "migration-worker.mjs"]) {
+    const requiredWorkerFiles = workerKind === "backend"
+      ? ["package.json", "backend-worker.mjs"]
+      : ["package.json", "package-lock.json", "migration-worker.mjs"]
+    for (const name of requiredWorkerFiles) {
       if (!wanted.some(e => e.path === directory + name && e.type === "blob")) throw new Error(`Source worker is missing ${name}`)
     }
     if (wanted.some(e => e.type !== "blob" || !["100644", "100755"].includes(e.mode))) throw new Error("Worker source must contain regular files")

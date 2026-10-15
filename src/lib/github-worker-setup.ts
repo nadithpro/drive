@@ -1,11 +1,12 @@
 import crypto from "node:crypto"
 import { githubApi, GitHubApiError, listGitHubWorkflows } from "./github-oauth"
-import { isWorkerWorkflow } from "./github-worker-workflow"
+import { isWorkerWorkflow, type GitHubWorkerKind } from "./github-worker-workflow"
 import { syncWorkerRepository, WorkerSyncPendingError } from "./github-worker-sync"
 
 export { isWorkerWorkflow } from "./github-worker-workflow"
 
-const WORKFLOW_DIRECTORY = "workers/migration-worker"
+const WORKFLOW_DIRECTORY = (kind: GitHubWorkerKind) => kind === "backend" ? "workers/backend-worker" : "workers/migration-worker"
+const MARKER_FILE = (kind: GitHubWorkerKind) => kind === "backend" ? ".drive-backend-worker.json" : ".drive-worker.json"
 type Repo = {
   id: number; name: string; full_name: string; owner: { login: string }
   default_branch: string; fork?: boolean; archived?: boolean; disabled?: boolean
@@ -36,10 +37,10 @@ const compact = (repo: Repo): Repo => ({
 const repoPath = (repo: Repo) => `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}`
 const contentPath = (path: string) => path.split("/").map(encodeURIComponent).join("/")
 
-async function getWorkerMarker(repo: Repo, token: string): Promise<{ workflow?: string } | null> {
+async function getWorkerMarker(repo: Repo, token: string, kind: GitHubWorkerKind): Promise<{ workflow?: string } | null> {
   let file: { content?: string; encoding?: string }
   try {
-    file = await githubApi(`${repoPath(repo)}/contents/.drive-worker.json?ref=${encodeURIComponent(repo.default_branch)}`, token)
+    file = await githubApi(`${repoPath(repo)}/contents/${MARKER_FILE(kind)}?ref=${encodeURIComponent(repo.default_branch)}`, token)
   } catch (error) {
     if (error instanceof GitHubApiError && (error.status === 404 || error.status === 409)) return null
     throw error
@@ -49,7 +50,7 @@ async function getWorkerMarker(repo: Repo, token: string): Promise<{ workflow?: 
     const marker = JSON.parse(Buffer.from(file.content, "base64").toString("utf8")) as Record<string, unknown>
     const workflow = typeof marker.workflow === "string" ? marker.workflow.trim() : ""
     const validWorkflowHint = workflow === "auto" || /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(workflow)
-    if (marker.schemaVersion !== 1 || marker.id !== "drive-migration-worker" || marker.directory !== WORKFLOW_DIRECTORY || !validWorkflowHint) return null
+    if (marker.schemaVersion !== 1 || marker.id !== (kind === "backend" ? "drive-backend-worker" : "drive-migration-worker") || marker.directory !== WORKFLOW_DIRECTORY(kind) || !validWorkflowHint) return null
     return { workflow: workflow === "auto" ? undefined : workflow }
   } catch { return null }
 }
@@ -57,7 +58,8 @@ async function getWorkerMarker(repo: Repo, token: string): Promise<{ workflow?: 
 type WorkflowFile = { id: string; name: string; path: string; state?: string; content: string }
 class WorkerWorkflowPendingError extends Error {}
 
-export async function assertWorkerWorkflow(input: { token: string; owner: string; repo: string; ref: string; workflow: string }) {
+export async function assertWorkerWorkflow(input: { token: string; owner: string; repo: string; ref: string; workflow: string; workerKind?: GitHubWorkerKind }) {
+  const workerKind = input.workerKind || "migration"
   if (!/^\.github\/workflows\/[^/]+\.ya?ml$/i.test(input.workflow)) throw new Error("Select a valid GitHub Actions workflow file")
   const file = await githubApi<{ type?: string; encoding?: string; content?: string }>(
     `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/contents/${contentPath(input.workflow)}?ref=${encodeURIComponent(input.ref)}`,
@@ -65,10 +67,10 @@ export async function assertWorkerWorkflow(input: { token: string; owner: string
   )
   if (file.type !== "file" || file.encoding !== "base64" || !file.content) throw new Error("Selected migration worker workflow is missing or unreadable")
   const content = Buffer.from(file.content, "base64").toString("utf8")
-  if (!isWorkerWorkflow(content)) throw new Error("Selected workflow is not a compatible Drive Migration Worker workflow")
+  if (!isWorkerWorkflow(content, workerKind)) throw new Error(`Selected workflow is not a compatible Drive ${workerKind === "backend" ? "Backend" : "Migration"} Worker workflow`)
 }
 
-async function detectWorkerWorkflow(repo: Repo, token: string): Promise<WorkflowFile> {
+async function detectWorkerWorkflow(repo: Repo, token: string, workerKind: GitHubWorkerKind): Promise<WorkflowFile> {
   const workflows = await listGitHubWorkflows(token, repo.owner.login, repo.name, repo.default_branch)
   if (workflows.length === 0) throw new WorkerWorkflowPendingError("GitHub has not indexed a workflow for this repository yet")
   const compatible: WorkflowFile[] = []
@@ -80,7 +82,7 @@ async function detectWorkerWorkflow(repo: Repo, token: string): Promise<Workflow
       )
       if (file.type !== "file" || file.encoding !== "base64" || !file.content) return null
       const content = Buffer.from(file.content, "base64").toString("utf8")
-      return isWorkerWorkflow(content) ? { ...workflow, content } : null
+      return isWorkerWorkflow(content, workerKind) ? { ...workflow, content } : null
     }))
     compatible.push(...batch.filter((workflow): workflow is WorkflowFile => Boolean(workflow)))
   }
@@ -113,11 +115,11 @@ function decode(cursor: string, token: string): State {
 
 // Every continuation is authenticated: callers cannot skip the scan to create a fork.
 // GitHub owns fork identity; replaying a fork request never chooses a new random name.
-export async function advanceWorkerSetup(token: string, cursor?: string, selectedId?: string) {
+export async function advanceWorkerSetup(token: string, cursor?: string, selectedId?: string, workerKind: GitHubWorkerKind = "migration") {
   let state: State
   if (cursor) state = decode(cursor, token)
   else {
-    const upstream = process.env.GITHUB_WORKER_SOURCE_REPO?.trim() || "iamnadith/Drive"
+    const upstream = (workerKind === "backend" ? process.env.GITHUB_BACKEND_WORKER_SOURCE_REPO : process.env.GITHUB_WORKER_SOURCE_REPO)?.trim() || "iamnadith/Drive"
     if (!/^[\w.-]+\/[\w.-]+$/.test(upstream)) throw new Error("Invalid GITHUB_WORKER_SOURCE_REPO")
     const source = compact(await githubApi<Repo>(`/repos/${upstream}`, token))
     state = { expires: Date.now() + 60 * 60 * 1000, source, page: 1, matches: [], phase: "scan", scanned: 0 }
@@ -138,7 +140,7 @@ export async function advanceWorkerSetup(token: string, cursor?: string, selecte
         // repository unexpectedly. Manual mode remains available for an
         // intentional upstream selection.
         if (repo.id === state.source.id) return null
-        const marker = await getWorkerMarker(repo, token)
+        const marker = await getWorkerMarker(repo, token, workerKind)
         if (marker) return { ...repo, workerMarker: true, workerWorkflowHint: marker.workflow }
         if (!repo.fork) return null
         return githubApi<Repo>(repoPath(repo), token)
@@ -223,16 +225,18 @@ export async function advanceWorkerSetup(token: string, cursor?: string, selecte
   }
   let workflow: WorkflowFile
   try {
-    try { workflow = await detectWorkerWorkflow({ ...repo, workerWorkflowHint: state.selected.workerWorkflowHint }, token) }
+    try { workflow = await detectWorkerWorkflow({ ...repo, workerWorkflowHint: state.selected.workerWorkflowHint }, token, workerKind) }
     catch (error) {
       if (!(error instanceof WorkerWorkflowPendingError)) throw error
       // An old fork may predate the worker files entirely. Bootstrap it from
       // the actual source workflow rather than polling stale files forever.
-      workflow = await detectWorkerWorkflow(state.source, token)
+      workflow = await detectWorkerWorkflow(state.source, token, workerKind)
     }
-    await syncWorkerRepository({ token, owner: repo.owner.login, repo: repo.name, workflow: workflow.path, sourceRepo: state.source.full_name, activateActions: true })
-    workflow = await detectWorkerWorkflow({ ...repo, workerWorkflowHint: workflow.path }, token)
-    for (const path of [`${workflow.path}`, `${WORKFLOW_DIRECTORY}/package.json`, `${WORKFLOW_DIRECTORY}/package-lock.json`, `${WORKFLOW_DIRECTORY}/migration-worker.mjs`]) {
+    await syncWorkerRepository({ token, owner: repo.owner.login, repo: repo.name, workflow: workflow.path, sourceRepo: state.source.full_name, activateActions: true, workerKind })
+    workflow = await detectWorkerWorkflow({ ...repo, workerWorkflowHint: workflow.path }, token, workerKind)
+    const workerDirectory = WORKFLOW_DIRECTORY(workerKind)
+    const requiredFiles = workerKind === "backend" ? ["package.json", "backend-worker.mjs"] : ["package.json", "package-lock.json", "migration-worker.mjs"]
+    for (const path of [workflow.path, ...requiredFiles.map((name) => `${workerDirectory}/${name}`)]) {
       const file = await githubApi<{ type?: string; encoding?: string; content?: string }>(`${repoPath(repo)}/contents/${contentPath(path)}?ref=${encodeURIComponent(repo.default_branch)}`, token)
       if (file.type !== "file") throw new Error(`Worker file ${path} is missing or invalid. Update the repository and retry.`)
     }

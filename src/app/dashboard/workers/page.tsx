@@ -5,6 +5,7 @@ import { Activity, Bot, Clock3, Copy, Eye, EyeOff, Github, HardDrive, Plus, Refr
 import { toast } from "sonner"
 import { useRouter, useSearchParams } from "next/navigation"
 import { GitHubWorkerSetup } from "@/components/dashboard/github-worker-setup"
+import { GitHubBackendWorkerSetupCard } from "@/components/dashboard/github-backend-worker-setup-card"
 import { CloudflareWorkerHosting } from "@/components/dashboard/cloudflare-worker-hosting"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Badge } from "@/components/ui/badge"
@@ -1194,7 +1195,7 @@ export default function WorkersPage() {
             const summary = worker.latestRun?.summary || worker.lastError || worker.notes || "No notes yet"
             const linkedWorkerJobs = getWorkerLinkedJobs(worker)
             const activeLinkedWorkerJobs = linkedWorkerJobs.filter((job) => !["completed", "failed", "canceled"].includes(job.status))
-            const activeWorkflowRuns = worker.runs.filter((run) => run.runType === "github_dispatch" && (run.status === "pending" || run.status === "running"))
+            const activeWorkflowRuns = worker.runs.filter((run) => ["github_dispatch", "github_backend_dispatch"].includes(run.runType) && (run.status === "pending" || run.status === "running"))
 
             return (
               <div key={worker.id} className="rounded-xl border bg-card p-4 shadow-sm">
@@ -1347,6 +1348,7 @@ export default function WorkersPage() {
       </Card>
 
       <MigrationWorkerSecretControl />
+      <GitHubBackendWorkerSetupCard connected={githubConnected} onConnect={startGitHubConnect} onCreated={() => void loadAgents()} />
       <CloudflareWorkerHosting />
 
       <AlertDialog open={!!confirmDeleteWorker} onOpenChange={(open: boolean) => !open && setConfirmDeleteWorker(null)}>

@@ -133,7 +133,7 @@ export async function GET() {
     const cookieToken = (await cookies()).get(GITHUB_TOKEN_COOKIE)?.value ?? ""
 
     for (const agent of agents) {
-      if (agent.provider !== "github_actions" || !agent.latestRun || agent.latestRun.runType !== "github_dispatch") continue
+      if (agent.provider !== "github_actions" || !agent.latestRun || !["github_dispatch", "github_backend_dispatch"].includes(agent.latestRun.runType)) continue
       if (!agent.githubRepoOwner || !agent.githubRepoName || !agent.githubWorkflowFile) continue
 
       const githubToken = (await getAgentGithubToken(agent.id)) || cookieToken || getGitHubTokenFallback()

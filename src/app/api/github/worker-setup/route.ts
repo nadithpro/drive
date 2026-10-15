@@ -17,7 +17,7 @@ export async function POST(request: Request) {
   if (!token) return NextResponse.json({ error: "Connect GitHub first" }, { status: 401 })
   try {
     const body = await request.json() as { cursor?: unknown; selectedId?: unknown }
-    const result = await advanceWorkerSetup(token, typeof body.cursor === "string" ? body.cursor : undefined, typeof body.selectedId === "string" ? body.selectedId : undefined)
+    const result = await advanceWorkerSetup(token, typeof body.cursor === "string" ? body.cursor : undefined, typeof body.selectedId === "string" ? body.selectedId : undefined, "migration")
     // Continuation pages are automatic polling, not separate user actions.
     if (typeof body.cursor !== "string" || typeof body.selectedId === "string") {
       await recordUserActivity(request, auth.user.id, {

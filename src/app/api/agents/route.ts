@@ -52,8 +52,12 @@ export async function POST(request: Request) {
         : "self_hosted"
     ) as AgentProvider
     const capabilities = parseCapabilities(body.capabilities)
+    const workerKind = body.workerKind === "backend" ? "backend" : "migration"
 
     if (!name) return NextResponse.json({ error: "Name is required" }, { status: 400 })
+    if (workerKind === "backend" && (!capabilities.includes("scan") || !capabilities.includes("verify") || capabilities.includes("bulk_migrate"))) {
+      return NextResponse.json({ error: "Backend Workers must have scan and verify capabilities and cannot claim migration transfer jobs" }, { status: 400 })
+    }
 
     if (provider === "github_actions") {
       if (!asString(body.githubRepoOwner).trim() || !asString(body.githubRepoName).trim() || !asString(body.githubWorkflowFile).trim()) {
@@ -82,15 +86,16 @@ export async function POST(request: Request) {
       ])
       if (!orchestrator.orchestratorUrl) throw new Error("Migration Orchestrator URL is not configured")
       if (workerSettings.sharedSecret.length < 24 || workerSettings.sharedSecret.length > 512) {
-        throw new Error("Configure the Migration Worker shared secret before adding a GitHub workflow")
+        throw new Error("Configure the shared worker secret before adding a GitHub workflow")
       }
       const codeSync = await syncWorkerRepository({
         token: githubTokenToUse,
         owner: asString(body.githubRepoOwner).trim(),
         repo: asString(body.githubRepoName).trim(),
         workflow: asString(body.githubWorkflowFile).trim(),
-        sourceRepo: process.env.GITHUB_WORKER_SOURCE_REPO,
+        sourceRepo: workerKind === "backend" ? process.env.GITHUB_BACKEND_WORKER_SOURCE_REPO || process.env.GITHUB_WORKER_SOURCE_REPO : process.env.GITHUB_WORKER_SOURCE_REPO,
         activateActions: true,
+        workerKind,
       })
       githubRef = codeSync.defaultBranch
       await syncGitHubWorkerSecrets({
@@ -116,6 +121,7 @@ export async function POST(request: Request) {
       githubRepositoryId: asString(body.githubRepositoryId).trim() || undefined,
       githubToken: githubTokenToUse,
       workerCount: provider === "github_actions" ? Number(body.workerCount) : 1,
+      workerKind,
       notes: asString(body.notes).trim() || undefined,
     })
 

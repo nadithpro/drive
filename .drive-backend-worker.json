@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "id": "drive-backend-worker",
+  "directory": "workers/backend-worker",
+  "workflow": ".github/workflows/backend-worker.yml"
+}

@@ -1,0 +1,49 @@
+name: Drive Backend Worker
+run-name: >-
+  Backend Worker / ${{ github.event.client_payload.agent_id || github.run_id }} / ${{ github.event.client_payload.worker_instance_id || github.run_id }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drive-backend-worker-${{ github.event.client_payload.worker_instance_id || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  repository_dispatch:
+    types: [drive-backend-worker]
+
+jobs:
+  run-backend-worker:
+    if: contains(github.workflow_ref, github.event.client_payload.workflow_file)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: workers/backend-worker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.code_ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install worker dependency
+        run: npm install --omit=dev --ignore-scripts
+      - name: Validate worker configuration
+        env:
+          SERVER_URL: ${{ secrets.DRIVE_MIGRATION_ORCHESTRATOR_URL }}
+          TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
+        run: |
+          test -n "$SERVER_URL" || { echo "::error::DRIVE_MIGRATION_ORCHESTRATOR_URL is missing"; exit 1; }
+          test -n "$TOKEN" || { echo "::error::DRIVE_WORKER_SHARED_SECRET is missing"; exit 1; }
+      - name: Run Backend Worker
+        env:
+          SERVER_URL: ${{ secrets.DRIVE_MIGRATION_ORCHESTRATOR_URL }}
+          TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
+          AGENT_ID: ${{ github.event.client_payload.agent_id }}
+          WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.run_id }}
+          DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id }}
+          DRIVE_WORKER_GENERATION: ${{ github.event.client_payload.worker_generation || '' }}
+          MAX_RUNTIME_SECONDS: ${{ github.event.client_payload.max_runtime_seconds || '21300' }}
+        run: npm start
