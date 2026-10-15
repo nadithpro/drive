@@ -822,7 +822,7 @@ async function hashObject(client, bucket, key, abortSignal) {
   } finally { closeBodyStream(body) }
 }
 
-async function inspectAssignedObjects(sourceClient, targetClient, sourceBucket, targetBucket, objects, abortSignal) {
+async function inspectAssignedObjects(sourceClient, targetClient, sourceBucket, targetBucket, objects, abortSignal, verifyEqualSizeContent = true) {
   const found = []
   await runConcurrent(objects, Math.min(2, COPY_CONCURRENCY), async (object) => {
     let targetHead
@@ -834,6 +834,15 @@ async function inspectAssignedObjects(sourceClient, targetClient, sourceBucket, 
     }
     const actualSize = typeof targetHead.ContentLength === "number" ? targetHead.ContentLength : -1
     if (actualSize !== Number(object.size)) { found.push({ key: object.key, size: actualSize }); return }
+    // Overwrite migrations copy every assigned source object regardless of
+    // whether the destination already has a same-sized object. Hashing both
+    // full bodies here only delays the copy; final bucket verification checks
+    // content after transfer. Preserve full hashing when overwrite is off so
+    // exact matches can still be safely skipped.
+    if (!verifyEqualSizeContent) {
+      found.push({ key: object.key, size: actualSize, destinationSize: actualSize, destinationEtag: typeof targetHead.ETag === "string" ? targetHead.ETag.replace(/^"|"$/g, "") : null })
+      return
+    }
     const [sourceSha256, destinationSha256] = await Promise.all([
       hashObject(sourceClient, sourceBucket, object.key, abortSignal),
       hashObject(targetClient, targetBucket, object.key, abortSignal),
@@ -1345,7 +1354,7 @@ async function processItem(jobId, payload, item, completedResults, state) {
       syncLiveProgress()
     })
     const allDestinationObjects = assignedInventory
-      ? await inspectAssignedObjects(sourceClient, targetClient, item.sourceBucket, item.targetBucket, assignedInventory, getJobAbortSignal(jobId))
+      ? await inspectAssignedObjects(sourceClient, targetClient, item.sourceBucket, item.targetBucket, assignedInventory, getJobAbortSignal(jobId), !overwrite)
       : await listAllObjects(targetClient, item.targetBucket, prefix, ({ count, key, size }) => {
       const delta = Math.max(0, count - destinationScanLastCount)
       destinationScanLastCount = count

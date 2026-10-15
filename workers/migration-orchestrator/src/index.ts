@@ -710,8 +710,7 @@ async function recoverQueueFailedJobs(db: Client, migrationId: string, generatio
     try {
       const result = await queue.query(`with retryable as materialized (
           select id,progress,result,error,
-            greatest(case when result->>'retryCount' ~ '^[0-9]+$' then (result->>'retryCount')::int else 0 end,
-              greatest(attempts-1,0)) retry_count
+            case when result->>'retryCount' ~ '^[0-9]+$' then (result->>'retryCount')::int else 0 end retry_count
           from drive_migration_queue_jobs
           where migration_id=$1 and generation=$2 and status='failed'
           order by updated_at,id for update skip locked

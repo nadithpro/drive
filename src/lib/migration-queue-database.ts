@@ -87,8 +87,7 @@ export async function readMigrationQueueLiveProjectionFromClient(db: Client, mig
         ), job_item_rows as (
         select q.status,q.updated_at,item.item_id,item.source_bucket,item.target_bucket,item.source_objects,item.source_bytes,
             greatest(case when q.result->>'retryCount' ~ '^[0-9]+$' then (q.result->>'retryCount')::int else 0 end,
-              case when q.result->>'verificationRetryCount' ~ '^[0-9]+$' then (q.result->>'verificationRetryCount')::int else 0 end,
-              greatest(q.attempts-1,0)) retry_count,
+              case when q.result->>'verificationRetryCount' ~ '^[0-9]+$' then (q.result->>'verificationRetryCount')::int else 0 end) retry_count,
             coalesce(res.transferred,0)::bigint result_transferred,coalesce(res.failed,0)::bigint result_failed,coalesce(res.skipped,0)::bigint result_skipped,
             coalesce(live.transferred,0)::bigint live_transferred,coalesce(live.failed,0)::bigint live_failed,coalesce(live.skipped,0)::bigint live_skipped,
             q.progress->>'currentItemId' current_item_id,q.progress->'currentFile' current_file,
