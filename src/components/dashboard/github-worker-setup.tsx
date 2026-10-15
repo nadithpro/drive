@@ -5,6 +5,16 @@ import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { WorkerRepository } from "@/lib/github-worker-setup"
 
+type WorkerSetupResponse = {
+  status?: string
+  cursor?: unknown
+  message?: unknown
+  error?: unknown
+  repo?: WorkerRepository
+  workflow?: unknown
+  candidates?: WorkerRepository[]
+}
+
 export function GitHubWorkerSetup({ connected, onSelect, onBusy, workerKind = "migration", startLabel }: {
   connected: boolean
   workerKind?: "migration" | "backend"
@@ -42,17 +52,10 @@ export function GitHubWorkerSetup({ connected, onSelect, onBusy, workerKind = "m
           body: JSON.stringify({ cursor: cursor.current, selectedId }), signal: abort.signal,
         })
         const responseText = await response.text()
-        let result: {
-          status?: string
-          cursor?: unknown
-          message?: unknown
-          error?: unknown
-          repo?: WorkerRepository
-          workflow?: unknown
-          candidates?: WorkerRepository[]
-        } | null = null
+        let result: WorkerSetupResponse | null = null
         try {
-          result = JSON.parse(responseText) as typeof result
+          const parsed: unknown = JSON.parse(responseText)
+          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) result = parsed as WorkerSetupResponse
         } catch {
           // Preserve the HTTP details below so HTML platform errors are actionable.
         }

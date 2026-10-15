@@ -600,7 +600,7 @@ async function ensureShards(db: Client, migration: Row) {
     const inventory = await db.query(`select coalesce(sum(source_objects),0)::bigint objects from drive_migration_items where migration_id=$1`, [migration.id])
     const objects = Number(inventory.rows[0]?.objects || 0)
     if (objects > 0) {
-      const message = `File Scanner found ${objects} source object(s), but this worker-pool generation created no durable migration jobs. Retry to rebuild the queue.`
+      const message = `Backend Worker found ${objects} source object(s), but this worker-pool generation created no durable migration jobs. Retry to rebuild the queue.`
       await db.query(`update drive_migration_items set slurper_status='precheck_failed',progress=coalesce(progress,'{}'::jsonb)||jsonb_build_object('stage','queue_materialization_failed','lastError',$2::text),last_progress_at=now(),updated_at=now() where migration_id=$1 and coalesce(slurper_status,'')<>'worker_bucket_create_failed'`, [migration.id, message])
       await db.query(`update drive_migrations set status='failed',sync_status='failed',sync_message=$2,last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [migration.id, message])
       return { generation, shardCount, created, inventoryPending: 0, queuePending: 0, terminalFailure: true, targetBuckets }
@@ -889,14 +889,14 @@ async function recordItemStageEvents(db: Client, migration: Row, generation: num
       where i.migration_id=$1
     ), pending as (
       select *,case status
-        when 'scanning' then 'File Scanner is listing source objects and creating the durable queue'
+        when 'scanning' then 'Backend Worker is listing source objects and creating the durable queue'
         when 'queued' then 'Source inventory is queued for migration workers'
         when 'running' then format('Migration workers are transferring files (%s/%s completed)',transferred,total)
-        when 'verifying' then 'Transfer completed; File Scanner verification started'
-        when 'completed' then 'File Scanner verification passed; bucket migration completed'
+        when 'verifying' then 'Transfer completed; Backend Worker verification started'
+        when 'completed' then 'Backend Worker verification passed; bucket migration completed'
         when 'verification_failed' then coalesce(
-          'File Scanner verification failed: '||nullif(verification_error,''),
-          format('File Scanner verification found %s missing, %s mismatched, %s extra objects',
+          'Backend Worker verification failed: '||nullif(verification_error,''),
+          format('Backend Worker verification found %s missing, %s mismatched, %s extra objects',
             coalesce(missing_objects,0),coalesce(mismatched_objects,0),coalesce(extra_objects,0)))
         when 'failed' then coalesce(nullif(verification_error,''),'Bucket migration failed')
         else 'Bucket state changed to '||status end message
@@ -945,8 +945,19 @@ async function ensureBucketVerification(db: Client, migration: Row, generation: 
     const ready = await db.query(`
       select i.id,coalesce(i.progress->'migrationInventory'->>'status','')='completed'
         and coalesce(i.progress->'migrationQueue'->>'status','')='completed'
-        and ($3::boolean or not exists(select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $2
-          and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed')) as ready
+        and case when $3::boolean then
+          i.progress->'migrationQueue'->>'totalJobs' ~ '^[0-9]+$'
+          and i.progress->'migrationQueue'->>'completedJobs' ~ '^[0-9]+$'
+          and i.progress->'migrationQueue'->>'remainingJobs' ~ '^[0-9]+$'
+          and i.progress->'migrationQueue'->>'failedJobs' ~ '^[0-9]+$'
+          and i.progress->'migrationQueue'->>'canceledJobs' ~ '^[0-9]+$'
+          and (i.progress->'migrationQueue'->>'totalJobs')::bigint=(i.progress->'migrationQueue'->>'completedJobs')::bigint
+          and (i.progress->'migrationQueue'->>'remainingJobs')::bigint=0
+          and (i.progress->'migrationQueue'->>'failedJobs')::bigint=0
+          and (i.progress->'migrationQueue'->>'canceledJobs')::bigint=0
+          and ((i.progress->'migrationQueue'->>'totalJobs')::bigint>0 or coalesce(i.source_objects,0)=0)
+        else not exists(select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $2
+          and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed') end as ready
       from drive_migration_items i where i.migration_id=$1
     `, [migration.id, `migration:${migration.id}:generation:${generation}:inventory:%`, directQueueMode])
     const readyIds = ready.rows.filter((row) => row.ready === true).map((row) => row.id)
@@ -969,7 +980,18 @@ async function ensureBucketVerification(db: Client, migration: Row, generation: 
     where i.migration_id=$1
       and i.progress->'migrationQueue'->>'status'='completed'
       and i.progress->'migrationInventory'->>'status'='completed'
-      and ($4::boolean or not exists (select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $3 and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed'))
+      and case when $4::boolean then
+        i.progress->'migrationQueue'->>'totalJobs' ~ '^[0-9]+$'
+        and i.progress->'migrationQueue'->>'completedJobs' ~ '^[0-9]+$'
+        and i.progress->'migrationQueue'->>'remainingJobs' ~ '^[0-9]+$'
+        and i.progress->'migrationQueue'->>'failedJobs' ~ '^[0-9]+$'
+        and i.progress->'migrationQueue'->>'canceledJobs' ~ '^[0-9]+$'
+        and (i.progress->'migrationQueue'->>'totalJobs')::bigint=(i.progress->'migrationQueue'->>'completedJobs')::bigint
+        and (i.progress->'migrationQueue'->>'remainingJobs')::bigint=0
+        and (i.progress->'migrationQueue'->>'failedJobs')::bigint=0
+        and (i.progress->'migrationQueue'->>'canceledJobs')::bigint=0
+        and ((i.progress->'migrationQueue'->>'totalJobs')::bigint>0 or coalesce(i.source_objects,0)=0)
+      else not exists (select 1 from drive_repair_jobs j where j.migration_id=$1 and j.work_key like $3 and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed') end
       and not exists (select 1 from drive_migration_verification_state v where v.migration_item_id=i.id and v.generation=$2)
     on conflict (migration_item_id) do update set
       migration_id=excluded.migration_id,generation=excluded.generation,source_scan_id=excluded.source_scan_id,
@@ -1087,7 +1109,7 @@ async function finalizeShards(db: Client, migration: Row, generation: number, sh
     await db.query(`update drive_migration_items i set slurper_status='verifying',last_progress_at=now(),updated_at=now(),progress=jsonb_set(coalesce(i.progress,'{}'::jsonb),'{stage}','"awaiting_independent_verification"'::jsonb)
       where i.migration_id=$1 and coalesce(i.slurper_status,'')<>'worker_bucket_create_failed'
         and not exists(select 1 from drive_migration_verification_state v where v.migration_item_id=i.id and v.generation=$2 and v.status='completed')`, [migration.id, generation])
-    await db.query(`update drive_migrations set status='verifying',sync_status='running',sync_message='File Scanner verification pending',last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [migration.id])
+    await db.query(`update drive_migrations set status='verifying',sync_status='running',sync_message='Backend Worker verification pending',last_synced_at=now(),updated_at=now() where id=$1 and status in('running','verifying')`, [migration.id])
     await db.query(`
     insert into drive_migration_verification_state(migration_item_id,migration_id,generation,status,phase)
     select id,migration_id,$2,'pending','source' from drive_migration_items where migration_id=$1
@@ -2883,7 +2905,10 @@ async function cycle(env: Env) {
       const verification = finalized.complete ? await finishOrRepair(db, migration, shards.generation) : { verification: "waiting_for_shards" }
       await renew(db, owner)
       const pendingVerification = await db.query(`select 1 from drive_migration_verification_state where migration_id=$1 and generation=$2 and status in('pending','running') limit 1`, [migration.id, shards.generation])
-      const fileScanner = shards.inventoryPending || (pendingVerification.rowCount || 0) > 0 || (finalized.complete && verification.verification === "pending") ? await wakeFileScanner(db) : "not_needed"
+      const fileScanner = opts(migration).executionMode !== "migration_workers"
+        && (shards.inventoryPending || (pendingVerification.rowCount || 0) > 0 || (finalized.complete && verification.verification === "pending"))
+        ? await wakeFileScanner(db)
+        : "not_used_for_worker_pool"
       const current = (await db.query(`select * from drive_migrations where id=$1`, [migration.id])).rows[0]
       if (["completed", "failed", "verification_failed", "canceled", "aborted"].includes(String(current?.status || "").toLowerCase())) {
         await abortMigrationWorkers(db, migration.id, `Migration is ${current.status}; stopping remaining GitHub workers`)

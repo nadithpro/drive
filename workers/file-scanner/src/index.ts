@@ -146,14 +146,7 @@ async function claim(db: Client, owner: string): Promise<Row | null> {
       -- Verify a bucket only after its own inventory and transfer jobs finish.
       -- Unfinished transfers in other buckets do not block this bucket.
       where m.status in('running','verifying')
-        and (m.options->>'executionMode' is distinct from 'migration_workers' or (
-          i.progress->'migrationInventory'->>'status'='completed'
-          and i.progress->'migrationQueue'->>'status'='completed'
-          and not exists(select 1 from drive_repair_jobs j where j.migration_id=m.id
-            and j.work_key like format('migration:%s:generation:%s:inventory:%%',m.id,greatest(1,coalesce(nullif(m.options->>'workerGeneration','')::int,1)))
-            and j.payload->'itemIds'->>0=i.id::text
-            and j.status<>'completed')
-        ))
+        and m.options->>'executionMode' is distinct from 'migration_workers'
         and ((v.status='pending' and (v.attempt_count=0 or v.updated_at<=now()-make_interval(mins=>least(30,power(2,least(v.attempt_count,5))::int))))
           or (v.status='running' and (v.lease_expires_at is null or v.lease_expires_at<now())))
       order by v.updated_at for update of v skip locked limit 1
@@ -185,6 +178,11 @@ async function claimGenericScan(db: Client, owner: string): Promise<Row | null> 
           select 1 from drive_migration_verification_state v
           where v.source_scan_id=s.id or v.destination_scan_id=s.id
         )
+        and (s.migration_id is null or exists (
+          select 1 from drive_migrations m where m.id=s.migration_id
+            and m.status in('running','verifying')
+            and m.options->>'executionMode' is distinct from 'migration_workers'
+        ))
       order by s.updated_at for update of s skip locked limit 1
     )
     update drive_bucket_scans s set status='running',lease_owner=$1,lease_expires_at=now()+interval '90 seconds',started_at=coalesce(started_at,now()),updated_at=now()
@@ -201,8 +199,10 @@ async function ensureScan(db: Client, task: Row, phase: "source" | "destination"
   const bucket = phase === "source" ? task.source_bucket : task.target_bucket
   const attached = await db.query(`
     with eligible as (
-      select migration_item_id from drive_migration_verification_state
-      where migration_item_id=$6 and generation=$7 and lease_owner=$8 for update
+      select v.migration_item_id from drive_migration_verification_state v
+      join drive_migrations m on m.id=v.migration_id
+      where v.migration_item_id=$6 and v.generation=$7 and v.lease_owner=$8
+        and m.options->>'executionMode' is distinct from 'migration_workers' for update of v
     ), created as (
       insert into drive_bucket_scans(id,account_id,bucket_name,kind,migration_id,migration_item_id,status,started_at,updated_at)
       select $1,$2,$3,$4,$5,$6,'running',now(),now() from eligible returning id
@@ -230,8 +230,10 @@ async function persistMigrationPage(db: Client, scanId: string, task: Row, phase
   try {
     const saved = await db.query(`
       with lease as (
-        select migration_item_id from drive_migration_verification_state
-        where migration_item_id=$2::uuid and generation=$3::int and lease_owner=$4::text
+        select v.migration_item_id from drive_migration_verification_state v
+        join drive_migrations m on m.id=v.migration_id
+        where v.migration_item_id=$2::uuid and v.generation=$3::int and v.lease_owner=$4::text
+          and m.options->>'executionMode' is distinct from 'migration_workers'
         for update
       ), incoming as (
         select x.key,x.size,x.is_dir_marker,x.etag,x.last_modified
@@ -246,7 +248,7 @@ async function persistMigrationPage(db: Client, scanId: string, task: Row, phase
         from incoming i left join previous p on p.key=i.key
       ), upserted as (
         insert into drive_bucket_scan_objects(scan_id,key,size,is_dir_marker,etag,last_modified)
-        select $1::uuid,key,size,is_dir_marker,etag,last_modified from incoming
+        select $1::uuid,key,size,is_dir_marker,etag,last_modified from incoming where exists(select 1 from lease)
         on conflict(scan_id,key) do update set size=excluded.size,is_dir_marker=excluded.is_dir_marker,etag=excluded.etag,last_modified=excluded.last_modified
         returning key
       ), saved_scan as (
@@ -287,8 +289,10 @@ async function compare(db: Client, task: Row) {
   try {
     const locked = await db.query(`
       with guard as (
-        select migration_item_id from drive_migration_verification_state
-        where migration_item_id=$1::uuid and generation=$2::int and lease_owner=$3::text for update
+        select v.migration_item_id from drive_migration_verification_state v
+        join drive_migrations m on m.id=v.migration_id
+        where v.migration_item_id=$1::uuid and v.generation=$2::int and v.lease_owner=$3::text
+          and m.options->>'executionMode' is distinct from 'migration_workers' for update of v
       ), deleted as (
         delete from drive_bucket_verify_diffs d using guard g where d.migration_item_id=g.migration_item_id returning d.id
       ) select exists(select 1 from guard) acquired
@@ -383,7 +387,11 @@ async function processGenericScan(db: Client, env: Env, task: Row) {
   const objects = [...new Map((page.objects as Row[]).map((object) => [object.key, object])).values()]
   const updated = await db.query(`
     with lease as (
-      select id,migration_id from drive_bucket_scans where id=$1::uuid and lease_owner=$5::text for update
+      select s.id,s.migration_id from drive_bucket_scans s
+      left join drive_migrations m on m.id=s.migration_id
+      where s.id=$1::uuid and s.lease_owner=$5::text
+        and (s.migration_id is null or (m.status in('running','verifying') and m.options->>'executionMode' is distinct from 'migration_workers'))
+      for update of s
     ), incoming as (
       select x.key,x.size,x.is_dir_marker,x.etag,x.last_modified
       from jsonb_to_recordset($6::jsonb) as x(key text,size bigint,is_dir_marker boolean,etag text,last_modified timestamptz)
@@ -442,8 +450,8 @@ async function heartbeatState(env: Env, owner: string) {
 async function heartbeatTask(env: Env, kind: ClaimedTask["kind"], task: Row) {
   await database(env, async (db) => {
     const result = kind === "migration"
-      ? await db.query(`update drive_migration_verification_state set lease_expires_at=now()+interval '90 seconds' where migration_item_id=$1 and generation=$2 and status='running' and lease_owner=$3`, [task.migration_item_id, task.generation, task.lease_owner])
-      : await db.query(`update drive_bucket_scans set lease_expires_at=now()+interval '90 seconds' where id=$1 and status='running' and lease_owner=$2`, [task.id, task.lease_owner])
+      ? await db.query(`update drive_migration_verification_state v set lease_expires_at=now()+interval '90 seconds' from drive_migrations m where v.migration_item_id=$1 and v.generation=$2 and v.status='running' and v.lease_owner=$3 and m.id=v.migration_id and m.options->>'executionMode' is distinct from 'migration_workers'`, [task.migration_item_id, task.generation, task.lease_owner])
+      : await db.query(`update drive_bucket_scans s set lease_expires_at=now()+interval '90 seconds' where s.id=$1 and s.status='running' and s.lease_owner=$2 and (s.migration_id is null or exists(select 1 from drive_migrations m where m.id=s.migration_id and m.options->>'executionMode' is distinct from 'migration_workers'))`, [task.id, task.lease_owner])
     if (result.rowCount !== 1) throw new Error("File Scanner task lease was lost")
   })
 }
@@ -517,9 +525,9 @@ async function cycle(env: Env) {
         const message = error instanceof Error ? error.message : String(error)
         await database(env, async (db) => {
           if (kind === "migration") {
-            await db.query(`update drive_migration_verification_state set status=case when $5::boolean then 'pending' else 'failed' end,attempt_count=attempt_count+1,last_error=$2,lease_owner=null,lease_expires_at=null,updated_at=now() where migration_item_id=$1 and generation=$3 and lease_owner=$4`, [task.migration_item_id, message, task.generation, task.lease_owner, isTransientScanError(error)])
+            await db.query(`update drive_migration_verification_state v set status=case when $5::boolean then 'pending' else 'failed' end,attempt_count=attempt_count+1,last_error=$2,lease_owner=null,lease_expires_at=null,updated_at=now() from drive_migrations m where v.migration_item_id=$1 and v.generation=$3 and v.lease_owner=$4 and m.id=v.migration_id and m.options->>'executionMode' is distinct from 'migration_workers'`, [task.migration_item_id, message, task.generation, task.lease_owner, isTransientScanError(error)])
           } else {
-            await db.query(`update drive_bucket_scans set status=case when $4::boolean then 'pending' else 'failed' end,attempt_count=attempt_count+1,error=$2,lease_owner=null,lease_expires_at=null,updated_at=now() where id=$1 and lease_owner=$3`, [task.id, message, task.lease_owner, isTransientScanError(error)])
+            await db.query(`update drive_bucket_scans s set status=case when $4::boolean then 'pending' else 'failed' end,attempt_count=attempt_count+1,error=$2,lease_owner=null,lease_expires_at=null,updated_at=now() where s.id=$1 and s.lease_owner=$3 and (s.migration_id is null or exists(select 1 from drive_migrations m where m.id=s.migration_id and m.options->>'executionMode' is distinct from 'migration_workers'))`, [task.id, message, task.lease_owner, isTransientScanError(error)])
           }
         }).catch(() => undefined)
         console.error("File Scanner task failed", { kind, taskId: task.migration_item_id || task.id, error: message })

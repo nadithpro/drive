@@ -877,7 +877,7 @@ export default function MigrationsPage() {
                 </Select>
                 <p className="text-xs text-muted-foreground">
                   {executionMode === "migration_workers"
-                    ? "The File Scanner builds one durable per-file queue. Dispatched workers claim files independently, while final verification remains owned by the File Scanner."
+                    ? "The Migration Orchestrator builds the durable per-file queue and dispatches transfer and Backend Workers. Backend Workers handle source scanning and independent verification."
                     : "Uses Cloudflare-managed Super Slurper jobs and its existing three-job limit."}
                 </p>
               </div>
