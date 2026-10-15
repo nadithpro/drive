@@ -30,6 +30,7 @@ type PoolSnapshot = { workerGeneration?: number; onlineWorkers?: number; activeT
 type Pagination = { pageIndex: number; pageSize: number; pageCount: number; total: number }
 type PoolAttempt = { generation: number; status: string; workerCount: number; runningWorkers: number; onlineWorkers: number; totalJobs: number; queuedJobs: number; runningJobs: number; remainingJobs?: number; completedJobs: number; failedJobs: number; canceledJobs: number; createdAt?: string; updatedAt?: string }
 type PoolWorkerRun = { id: string; agentId: string; status: string; online: boolean; abortRequested?: boolean; externalRunId?: string; instanceId?: string; jobId?: string; currentStatus?: string; lastHeartbeatAt?: string; completedJobs?: number; failedJobs?: number; finishedJobs?: number; completedFiles?: number; failedFiles?: number; completedBytes?: number; createdAt?: string; updatedAt?: string }
+type BackendWorkerRun = { id: string; agentId: string; status: string; phase: string; workerInstanceId: string; externalRunId?: string; repository?: string; summary?: string; error?: string; createdAt?: string; updatedAt?: string }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null }
 function num(value: unknown) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0 }
@@ -84,6 +85,8 @@ export default function MigrationWorkerPoolDetailsPage() {
   const [snapshot, setSnapshot] = React.useState<PoolSnapshot>({})
   const [attempts, setAttempts] = React.useState<PoolAttempt[]>([])
   const [workerRuns, setWorkerRuns] = React.useState<PoolWorkerRun[]>([])
+  const [backendWorkerRuns, setBackendWorkerRuns] = React.useState<BackendWorkerRun[]>([])
+  const [backendDispatch, setBackendDispatch] = React.useState<Record<string, unknown> | null>(null)
   const [migrationStatus, setMigrationStatus] = React.useState("")
   const [selectedGeneration, setSelectedGeneration] = React.useState(0)
   const selectedGenerationRef = React.useRef(0)
@@ -125,6 +128,8 @@ export default function MigrationWorkerPoolDetailsPage() {
       })
       setAttempts(Array.isArray(data.attempts) ? data.attempts : [])
       setWorkerRuns(Array.isArray(data.workerRuns) ? data.workerRuns : [])
+      setBackendWorkerRuns(Array.isArray(data.backendWorkerRuns) ? data.backendWorkerRuns : [])
+      setBackendDispatch(isRecord(data.backendDispatch) ? data.backendDispatch : null)
       setMigrationStatus(String(data.migrationStatus || ""))
       if (selectedGeneration === 0 && Number(data.selectedGeneration) > 0) setSelectedGeneration(Number(data.selectedGeneration))
       if (isRecord(data.jobPagination)) setPagination(data.jobPagination as Pagination)
@@ -438,6 +443,22 @@ export default function MigrationWorkerPoolDetailsPage() {
           resetKey={selectedGeneration}
           emptyState="No workers were dispatched for this attempt."
         />
+        <Card className="gap-0 py-0">
+          <CardHeader className="px-5 py-3 pb-2">
+            <CardTitle className="text-sm">Backend Worker runs</CardTitle>
+            <CardDescription className="mt-1">GitHub hosted workers scan buckets and prepare verification tasks. These are separate from file transfer workers.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 px-5 pb-4 pt-0">
+            {backendWorkerRuns.length ? backendWorkerRuns.map((run) => (
+              <div key={run.id} className="grid gap-2 rounded-xl border p-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:items-center">
+                <div className="min-w-0"><p className="truncate font-medium">{run.repository || "GitHub Actions"} · {run.workerInstanceId ? run.workerInstanceId.slice(0, 8) : "worker"}</p><p className="mt-1 truncate text-muted-foreground">{run.summary || run.error || `Run ${run.externalRunId || run.id}`}</p>{run.error ? <p className="mt-1 break-words text-destructive">{run.error}</p> : null}</div>
+                <div className="flex items-center gap-2">{statusBadge(run.status)}<Badge variant="outline">{run.phase}</Badge></div>
+                <WorkerTableDate value={run.updatedAt || run.createdAt} />
+              </div>
+            )) : <p className="text-xs text-muted-foreground">No Backend Worker runs have been recorded for this generation.</p>}
+            {backendDispatch ? <p className="text-xs text-muted-foreground">Orchestrator dispatch: {String(backendDispatch.reason || "recorded")} · {formatNumber(num(backendDispatch.pendingTasks))} pending scan/verification tasks · {formatNumber(num(backendDispatch.eligibleAgents))} eligible agents · {formatNumber(num(backendDispatch.dispatched))} dispatched</p> : null}
+          </CardContent>
+        </Card>
         <DashboardLogsCard
           key={selectedGeneration}
           title="Worker Logs"

@@ -53,6 +53,38 @@ async function getDispatchedWorkers(migrationId: string, generation: number) {
   return value
 }
 
+async function getBackendWorkerStatus(migrationId: string, generation: number) {
+  const [runs, state] = await Promise.all([
+    queryDb<Record<string, unknown>>(`select r.id,r.agent_id,r.status,r.external_run_id,r.payload,r.summary,r.error,r.created_at,r.updated_at,
+        a.github_repo_owner,a.github_repo_name
+      from drive_agent_runs r join drive_agents a on a.id=r.agent_id
+      where r.run_type='github_backend_dispatch' and r.payload->>'migrationId'=$1
+        and greatest(1,coalesce(nullif(r.payload->>'workerGeneration','')::int,1))=$2
+        and r.created_at>now()-interval '14 days'
+      order by r.created_at desc limit 100`, [migrationId, generation]),
+    queryDb<{ last_result: Record<string, unknown> | null }>(`select last_result from drive_migration_orchestrator_state where id=true limit 1`),
+  ])
+  const workerRuns = runs.rows.map((row) => {
+    const payload = isRecord(row.payload) ? row.payload : {}
+    return {
+      id: String(row.id),
+      agentId: String(row.agent_id || ""),
+      status: String(row.status || "pending"),
+      phase: String(payload.phase || "created"),
+      workerInstanceId: String(payload.workerInstanceId || ""),
+      externalRunId: row.external_run_id ? String(row.external_run_id) : undefined,
+      repository: [row.github_repo_owner, row.github_repo_name].filter(Boolean).join("/"),
+      summary: row.summary ? String(row.summary) : undefined,
+      error: row.error ? String(row.error) : undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }
+  })
+  const lastResult = state.rows[0]?.last_result
+  const backendDispatch = isRecord(lastResult) && isRecord(lastResult.backendDispatch) ? lastResult.backendDispatch : null
+  return { backendWorkerRuns: workerRuns, backendDispatch }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -738,6 +770,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     const pageSize = Math.max(10, Math.min(100, Math.floor(Number(url.searchParams.get("pageSize") || 25) || 25)))
     const selectedGeneration = Math.max(0, Math.floor(Number(url.searchParams.get("generation") || 0) || 0))
     const saved = await cachedPool(id, pageIndex, pageSize, selectedGeneration)
+    const backendWorkerStatus = await getBackendWorkerStatus(id, saved.selectedGeneration)
     const jobId = url.searchParams.get("jobId")
     let selectedJob: Record<string, unknown> | null = null
     if (jobId && /^[0-9a-f-]{36}$/i.test(jobId)) {
@@ -755,7 +788,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
         if (row) selectedJob = { id: row.id, migrationId: row.migration_id, status: row.status, mode: row.mode, claimedByAgentId: row.claimed_by_agent_id, payload: row.payload || {}, progress: row.progress || {}, result: row.result || {}, summary: row.summary, error: row.error, createdAt: row.created_at, updatedAt: row.updated_at, lastHeartbeatAt: row.last_heartbeat_at, completedAt: row.completed_at }
       }
     }
-    return NextResponse.json({ ...saved, ...(jobId ? { job: selectedJob } : {}), source: "database" }, { headers: { "Cache-Control": "no-store, max-age=0" } })
+    return NextResponse.json({ ...saved, ...backendWorkerStatus, ...(jobId ? { job: selectedJob } : {}), source: "database" }, { headers: { "Cache-Control": "no-store, max-age=0" } })
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },
