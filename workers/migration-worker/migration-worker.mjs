@@ -1354,7 +1354,13 @@ async function processItem(jobId, payload, item, completedResults, state) {
       syncLiveProgress()
     })
     const allDestinationObjects = assignedInventory
-      ? await inspectAssignedObjects(sourceClient, targetClient, item.sourceBucket, item.targetBucket, assignedInventory, getJobAbortSignal(jobId), !overwrite)
+      ? overwrite
+        // Overwrite mode copies every assigned source object. A destination
+        // HEAD (or content hash) per file adds no decision value here and can
+        // keep large buckets in repair_scan for hours. The final bucket
+        // verification checks the destination after all copies finish.
+        ? []
+        : await inspectAssignedObjects(sourceClient, targetClient, item.sourceBucket, item.targetBucket, assignedInventory, getJobAbortSignal(jobId), true)
       : await listAllObjects(targetClient, item.targetBucket, prefix, ({ count, key, size }) => {
       const delta = Math.max(0, count - destinationScanLastCount)
       destinationScanLastCount = count
@@ -1388,7 +1394,9 @@ async function processItem(jobId, payload, item, completedResults, state) {
     const shardSourceBytes = sourceObjects.reduce((sum, object) => sum + Number(object?.size || 0), 0)
     sourceObjectCount = allSourceObjects.length
     const shardObjectCount = sourceObjects.length
-    const initialDiff = diffObjectsByListing(sourceObjects, destinationObjects, ({ checked, key, size, missing, mismatched }) => {
+    const initialDiff = overwrite
+      ? { missing: [], mismatched: [] }
+      : diffObjectsByListing(sourceObjects, destinationObjects, ({ checked, key, size, missing, mismatched }) => {
       state.currentFile = {
         itemId: item.id,
         bucket: item.sourceBucket,
@@ -1446,7 +1454,9 @@ async function processItem(jobId, payload, item, completedResults, state) {
       processedFiles: transferred + failed + skipped,
       summary: `Scan complete for ${item.sourceBucket}${shardLabel}: ${alreadyPresent} already verified, ${initialMissing} missing, ${initialMismatched} mismatched`,
     })
-    pushLog(state, `Scan complete for ${item.sourceBucket}`, {
+    pushLog(state, overwrite
+      ? `Skipping destination pre-scan for ${item.sourceBucket}; overwrite will copy all source objects`
+      : `Scan complete for ${item.sourceBucket}`, {
       itemId: item.id,
       stage,
       alreadyPresent,
