@@ -702,7 +702,9 @@ export function cloudflareInstallationReady(installation: Awaited<ReturnType<typ
   return ORDER.every((worker) => {
     const current = installation.workers[worker]
     const checkedAt = current.lastCheckedAt ? new Date(current.lastCheckedAt).getTime() : 0
-    return current.deployed === true && current.verified === true && Boolean(current.url && current.deployedAt && current.verifiedAt) && Number.isFinite(checkedAt) && checkedAt > 0
+    // `deployedAt` and `verifiedAt` are display metadata. A successful,
+    // authenticated health check is the evidence that the Worker is live.
+    return current.deployed === true && current.verified === true && Boolean(current.url) && Number.isFinite(checkedAt) && checkedAt > 0
   })
 }
 
@@ -739,6 +741,7 @@ export async function installCloudflareWorkers(input: { mode: InstallMode; token
     const previousRuntime = await currentRuntimeSnapshot()
     let githubSecretsSynchronized = false
     let workerSharedSecretForSync = ""
+    let workerBindingsMayHaveChanged = false
     const hasSuppliedToken = ORDER.some((worker) => Boolean(String(input.tokens[worker] || "").trim()))
     if (previous?.status === "ready" && !input.restart && !input.checkForUpdates && !input.forceRedeploy && !hasSuppliedToken) return getCloudflareInstallation()
     const supplied = input.mode === "single"
@@ -809,6 +812,10 @@ export async function installCloudflareWorkers(input: { mode: InstallMode; token
         if (input.forceRedeploy || !current.deployed || !current.verified || !artifactMatches) {
           current.deployed = false; current.verified = false; current.verifiedAt = undefined; current.latencyMs = undefined; current.build = undefined
           state.workers[worker].phase = "uploading"; state.workers[worker].error = undefined; state.step = `${worker}_uploading`; await saveState(state)
+          // Once a script upload starts, Cloudflare may have accepted its new
+          // secret even if a later subdomain, health, or runtime check fails.
+          // From this point the old panel secret is no longer safe to restore.
+          workerBindingsMayHaveChanged = true
           await uploadWorker({ worker, token: tokens[worker], accountId: accounts[worker].id, hyperdriveId: state.hyperdrives![accounts[worker].id].id, entry: artifactEntry, code: releaseArtifacts[worker], state })
           state.workers[worker].phase = "configuring"; state.step = `${worker}_configuring`; await saveState(state)
           state.workers[worker].url = await workersDevUrl(tokens[worker], accounts[worker].id, state.workers[worker].scriptName)
@@ -874,7 +881,14 @@ export async function installCloudflareWorkers(input: { mode: InstallMode; token
       }
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
-          await writeRuntimeSnapshot(previousRuntime)
+          if (workerBindingsMayHaveChanged) {
+            // Keep the panel's credentials aligned with the uploaded Worker.
+            // Disable scheduling until a later successful verification; never
+            // roll back credentials underneath a live deployed script.
+            await saveRuntimeConfiguration(state, false)
+          } else {
+            await writeRuntimeSnapshot(previousRuntime)
+          }
           runtimeRestoreError = null
           break
         } catch (restoreError) {

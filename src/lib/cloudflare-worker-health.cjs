@@ -25,6 +25,11 @@ function runtimeHealthError(payload) {
   const detail = typeof state.last_error === "string" ? state.last_error
     : typeof state.lastError === "string" ? state.lastError
       : ""
+  // /status has already passed bearer authentication before this function is
+  // called. That proves the Worker's current secret matches the panel database,
+  // so a persisted queue-sync 401 is from an earlier cycle and should not block
+  // setup from re-enabling the orchestrator. The next cycle will clear it.
+  if (/^Migration queue status sync failed \(HTTP 401\): Invalid orchestration secret$/i.test(detail.trim())) return null
   // A completed storage-sync cycle can retain this summary when an optional
   // panel-side delivery/CORS maintenance row fails. That work has its own
   // durable retry state and must not mark the deployed Worker itself offline.

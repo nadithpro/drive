@@ -70,7 +70,7 @@ export function CloudflareWorkerHosting({ onboarding = false, onReady }: { onboa
     void refresh().then(() => syncWorkers()).catch(() => undefined)
   }, [refresh, syncWorkers])
   React.useEffect(() => {
-    const ready = installation?.status === "ready" && installation.tokensSaved === true && (Object.values(installation.workers) as Installation["workers"][WorkerKey][]).every((worker) => worker.deployed && worker.verified && worker.url && worker.deployedAt && worker.verifiedAt && worker.lastCheckedAt)
+    const ready = installation?.status === "ready" && installation.tokensSaved === true && (Object.values(installation.workers) as Installation["workers"][WorkerKey][]).every((worker) => worker.deployed && worker.verified && worker.url && worker.lastCheckedAt)
     if (ready) { repairAttempted.current = false; onReady?.(); return }
     if ((installation?.status !== "failed" && installation?.status !== "running") || !installation.tokensSaved || repairAttempted.current || busy) return
     repairAttempted.current = true
@@ -155,7 +155,7 @@ export function CloudflareWorkerHosting({ onboarding = false, onReady }: { onboa
   }
   const installationReady = installation?.status === "ready" && installation.tokensSaved === true && workers.every((worker) => {
     const current = installation.workers[worker]
-    return Boolean(current.deployed && current.verified && current.url && current.deployedAt && current.verifiedAt && current.lastCheckedAt)
+    return Boolean(current.deployed && current.verified && current.url && current.lastCheckedAt)
   })
   const tokenInputReady = Boolean(token && (mode === "single" || (scannerToken && migrationToken)))
 
@@ -207,7 +207,7 @@ export function CloudflareWorkerHosting({ onboarding = false, onReady }: { onboa
           <CardContent className="p-0">
             <ItemGroup>{workers.map((worker, index) => {
               const current = installation?.tokensSaved ? installation.workers[worker] : undefined
-              const live = Boolean(current?.deployed && current.verified && current.url && current.deployedAt && current.verifiedAt && current.lastCheckedAt)
+              const live = Boolean(current?.deployed && current.verified && current.url && current.lastCheckedAt)
               const phase = live ? "verified" : current?.phase === "failed" ? "failed" : current?.phase || "not deployed"
               const phaseLabel = ["uploading", "configuring", "deployed", "deleting", "verifying"].includes(phase) ? "deploying" : phase
               return <React.Fragment key={worker}>{index > 0 ? <Separator /> : null}<Item className="rounded-none border-0 px-5 py-5 sm:px-7"><ItemMedia variant="icon">{live ? <CheckCircle2 /> : phase === "failed" ? <TriangleAlert /> : <ServerCog />}</ItemMedia><ItemContent><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><ItemTitle>{labels[worker]}</ItemTitle><p className="mt-1 text-xs text-muted-foreground">{current?.scriptName || "Waiting for a verified deployment"}</p></div><Badge variant={live ? "default" : phase === "failed" ? "destructive" : "secondary"}>{live ? "Live" : phaseLabel}</Badge></div>{current?.url ? <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 xl:grid-cols-5"><p className="truncate" title={current.url}>URL <span className="block text-foreground">{current.url}</span></p><p>Cloudflare account <span className="block text-foreground">{current.accountName || "Validated account"}</span></p><p>Last deployed <span className="block text-foreground">{current.deployedAt ? new Date(current.deployedAt).toLocaleString() : "Unknown"}</span></p><p>Last response <span className="block text-foreground">{current.latencyMs != null ? `${current.latencyMs} ms` : "No response recorded"}</span></p><p>Live check <span className="block text-foreground">{current.lastCheckedAt ? new Date(current.lastCheckedAt).toLocaleString() : "Never checked"}</span></p></div> : <p className="mt-2 text-sm text-muted-foreground">No deployed Worker URL exists yet. Account details will appear only after deployment.</p>}{current?.error && current.url ? <p className="mt-2 text-sm text-destructive">{current.error}</p> : null}</ItemContent></Item></React.Fragment>

@@ -333,6 +333,7 @@ test("analytics aggregates bucket and verification summaries in one database rou
   assert.match(summary, /from public\.drive_migrations[\s\S]*?order by created_at desc,id desc\s+limit 100/i)
   assert.match(summary, /from public\.drive_repair_jobs[\s\S]*?order by created_at desc,id desc\s+limit 100/i)
   assert.match(summary, /from public\.drive_analytics_active_account_snapshots[\s\S]*?limit 730/i)
+  assert.doesNotMatch(summary, /join active_account current_account on current_account\.id = snapshots\.account_id/i)
   assert.doesNotMatch(analytics, /getUserSummary|listAnalyticsMigrations/)
   assert.doesNotMatch(analytics, /selectRows<BucketStatsRow>/)
   assert.doesNotMatch(analytics, /countRows\(/)
