@@ -2399,7 +2399,7 @@ async function completeBackendVerification(db: Client, task: Row) {
             and j.result->'items'->0->'integrityProofs'->0->>'sha256' ~ '^[0-9a-f]{64}$'
             and trim(both '"' from coalesce(j.result->'items'->0->'integrityProofs'->0->>'destinationEtag',''))=trim(both '"' from coalesce(d.etag,''))
           ))
-        ) returning kind
+        )) returning kind
       ), extra_diffs as (
         insert into drive_bucket_verify_diffs(id,migration_item_id,source_scan_id,dest_scan_id,kind,key,source_size,dest_size)
         select gen_random_uuid(),$1::uuid,$4::uuid,$5::uuid,'extra',d.key,null,d.size from drive_bucket_scan_objects d
