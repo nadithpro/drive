@@ -212,22 +212,28 @@ async function legacyEnsureSchema(db: Client) {
   `)
   await db.query(`
     create table if not exists drive_analytics_active_account_snapshots (
-      captured_day date primary key,
-      account_id uuid not null,
+      captured_day date not null,
+      account_id uuid,
+      scope text not null default 'account',
       account_label text,
       account_email text,
       buckets integer not null default 0,
       objects bigint not null default 0,
       bytes bigint not null default 0,
       bucket_fingerprint text,
-      captured_at timestamptz not null default now()
+      captured_at timestamptz not null default now(),
+      primary key (scope, captured_day)
     )
   `)
   await db.query(`alter table drive_analytics_active_account_snapshots add column if not exists bucket_fingerprint text`)
+  await db.query(`alter table drive_analytics_active_account_snapshots add column if not exists scope text not null default 'account'`)
+  await db.query(`alter table drive_analytics_active_account_snapshots alter column account_id drop not null`)
+  await db.query(`alter table drive_analytics_active_account_snapshots drop constraint if exists drive_analytics_active_account_snapshots_pkey`)
+  await db.query(`alter table drive_analytics_active_account_snapshots add constraint drive_analytics_active_account_snapshots_pkey primary key (scope, captured_day)`)
   await db.query(`
     with ranked as (
       select ctid, row_number() over (
-        partition by captured_day
+        partition by scope, captured_day
         order by captured_at desc, account_id desc
       ) position
       from drive_analytics_active_account_snapshots
@@ -236,7 +242,7 @@ async function legacyEnsureSchema(db: Client) {
     using ranked
     where snapshots.ctid = ranked.ctid and ranked.position > 1
   `)
-  await db.query(`create unique index if not exists drive_analytics_active_account_snapshots_one_per_day_idx on drive_analytics_active_account_snapshots (captured_day)`)
+  await db.query(`drop index if exists drive_analytics_active_account_snapshots_one_per_day_idx`)
   await db.query(`create index if not exists drive_analytics_active_account_snapshots_day_idx on drive_analytics_active_account_snapshots (captured_day desc)`)
   await db.query(`
     create table if not exists drive_backend_orchestrator_metric_candidates (
@@ -807,36 +813,30 @@ async function clearSyncProgress(db: Client) {
   await db.query(`delete from drive_backend_orchestrator_progress where id=true`)
 }
 
-async function recordDailyAccountSnapshot(db: Client, accountId: string) {
+async function recordDailyAccountSnapshot(db: Client, _accountId: string) {
   await db.query(`
     with current_state as (
       select
-        a.id account_id,
-        a.label account_label,
-        a.email account_email,
-        a.total_buckets buckets,
-        a.total_objects objects,
-        a.total_bytes bytes,
-        md5(coalesce((
-          select string_agg(
-            stats.bucket_name || ':' || stats.objects::text || ':' || stats.bytes::text,
-            '|' order by stats.bucket_name
-          )
-          from drive_bucket_stats stats
-          where stats.account_id = a.id
+        count(distinct stats.account_id::text || ':' || stats.bucket_name)::integer buckets,
+        coalesce(sum(stats.objects), 0)::bigint objects,
+        coalesce(sum(stats.bytes), 0)::bigint bytes,
+        md5(coalesce(string_agg(
+          stats.account_id::text || ':' || stats.bucket_name || ':' || stats.objects::text || ':' || stats.bytes::text,
+          '|' order by stats.account_id, stats.bucket_name
         ), '')) bucket_fingerprint
       from drive_accounts a
-      where a.id = $1 and a.status = 'active'
+      left join drive_bucket_stats stats on stats.account_id = a.id
+      where a.status = 'active'
     ), previous_state as (
       select bucket_fingerprint
       from drive_analytics_active_account_snapshots
-      where captured_day < current_date
+      where scope = 'system' and captured_day < current_date
       order by captured_day desc
       limit 1
     ), remove_reverted_day as (
       delete from drive_analytics_active_account_snapshots snapshots
       using current_state current
-      where snapshots.captured_day = current_date
+      where snapshots.scope = 'system' and snapshots.captured_day = current_date
         and exists (
           select 1 from previous_state previous
           where previous.bucket_fingerprint is not null
@@ -845,8 +845,8 @@ async function recordDailyAccountSnapshot(db: Client, accountId: string) {
       returning snapshots.captured_day
     )
     insert into drive_analytics_active_account_snapshots
-      (captured_day, account_id, account_label, account_email, buckets, objects, bytes, bucket_fingerprint, captured_at)
-    select current_date, current.account_id, current.account_label, current.account_email,
+      (captured_day, account_id, scope, account_label, account_email, buckets, objects, bytes, bucket_fingerprint, captured_at)
+    select current_date, null, 'system', 'All active accounts', null,
            current.buckets, current.objects, current.bytes, current.bucket_fingerprint, now()
     from current_state current
     where not exists (
@@ -854,8 +854,9 @@ async function recordDailyAccountSnapshot(db: Client, accountId: string) {
       where previous.bucket_fingerprint is not null
         and previous.bucket_fingerprint = current.bucket_fingerprint
     )
-    on conflict (captured_day) do update set
+    on conflict (scope, captured_day) do update set
       account_id = excluded.account_id,
+      scope = excluded.scope,
       account_label = excluded.account_label,
       account_email = excluded.account_email,
       buckets = excluded.buckets,
@@ -863,7 +864,7 @@ async function recordDailyAccountSnapshot(db: Client, accountId: string) {
       bytes = excluded.bytes,
       bucket_fingerprint = excluded.bucket_fingerprint,
       captured_at = excluded.captured_at
-  `, [accountId])
+  `)
 }
 
 async function pendingMetricDecreases(db: Client, accountId: string, metrics: BucketMetric[]) {

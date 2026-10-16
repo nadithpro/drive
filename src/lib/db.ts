@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { Pool } from "pg"
 import type { PoolClient, QueryResultRow } from "pg"
 
-const DRIVE_SCHEMA_VERSION = 2026091409
+const DRIVE_SCHEMA_VERSION = 2026101601
 
 const DRIVE_USER_INDEXES = [
   { name: "drive_users_status_role_idx", sql: "create index concurrently if not exists drive_users_status_role_idx on public.drive_users (status, role)" },
@@ -931,6 +931,29 @@ export async function ensureDriveSchema(): Promise<void> {
       await queryDb(
         `create index if not exists drive_analytics_bucket_snapshots_captured_idx on drive_analytics_bucket_snapshots (captured_at desc);`
       )
+
+      await queryDb(`
+        create table if not exists drive_analytics_active_account_snapshots (
+          captured_day date not null,
+          account_id uuid,
+          scope text not null default 'account',
+          account_label text,
+          account_email text,
+          buckets integer not null default 0,
+          objects bigint not null default 0,
+          bytes bigint not null default 0,
+          bucket_fingerprint text,
+          captured_at timestamptz not null default now(),
+          primary key (scope, captured_day)
+        );
+      `)
+      await queryDb(`alter table public.drive_analytics_active_account_snapshots add column if not exists scope text not null default 'account';`)
+      await queryDb(`alter table public.drive_analytics_active_account_snapshots add column if not exists bucket_fingerprint text;`)
+      await queryDb(`alter table public.drive_analytics_active_account_snapshots alter column account_id drop not null;`)
+      await queryDb(`alter table public.drive_analytics_active_account_snapshots drop constraint if exists drive_analytics_active_account_snapshots_pkey;`)
+      await queryDb(`alter table public.drive_analytics_active_account_snapshots add constraint drive_analytics_active_account_snapshots_pkey primary key (scope, captured_day);`)
+      await queryDb(`drop index if exists public.drive_analytics_active_account_snapshots_one_per_day_idx;`)
+      await queryDb(`create index if not exists drive_analytics_active_account_snapshots_day_idx on public.drive_analytics_active_account_snapshots (captured_day desc);`)
 
       await queryDb(`
         create table if not exists drive_storage_stats_history (

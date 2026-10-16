@@ -67,7 +67,8 @@ type AnalyticsRepairJob = {
 
 type ActiveAccountSnapshotRow = {
   captured_day: string
-  account_id: string
+  account_id: string | null
+  scope: "account" | "system"
   account_label: string | null
   account_email: string | null
   buckets: string | number | null
@@ -263,18 +264,16 @@ async function listAnalyticsMigrationItems(start: Date, rangeIsAll: boolean): Pr
 
 async function getAnalyticsSqlSummary(): Promise<AnalyticsSqlSummaryRow> {
   const { rows } = await queryDb<AnalyticsSqlSummaryRow>(`
-    with active_account as materialized (
-      select id from public.drive_accounts where status='active' order by updated_at desc limit 1
-    ), active_buckets as materialized (
+    with active_buckets as materialized (
       select s.id,s.account_id,s.bucket_name,s.objects,s.bytes,s.status,s.error,s.updated_at
       from public.drive_bucket_stats s
-      join active_account a on a.id=s.account_id
+      join public.drive_accounts a on a.id=s.account_id and a.status='active'
     ), bucket_status_counts as (
       select coalesce(nullif(status,''),'unknown') status,count(*) count
       from public.drive_bucket_stats
       group by 1
     ), active_bucket_totals as (
-      select count(distinct bucket_name)::text bucket_count,
+      select count(*)::text bucket_count,
         coalesce(sum(objects),0)::text objects,
         coalesce(sum(bytes),0)::text bytes,
         max(updated_at)::text newest_updated_at,
@@ -342,8 +341,9 @@ async function getAnalyticsSqlSummary(): Promise<AnalyticsSqlSummaryRow> {
       coalesce((
         select jsonb_agg(to_jsonb(daily) order by daily.captured_day asc)
         from (
-          select captured_day::text as captured_day,account_id,account_label,account_email,buckets,objects,bytes,captured_at
+          select captured_day::text as captured_day,account_id,scope,account_label,account_email,buckets,objects,bytes,captured_at
           from public.drive_analytics_active_account_snapshots snapshots
+          where scope='system'
           order by captured_day desc
           limit 730
         ) daily
@@ -481,12 +481,10 @@ async function buildAnalyticsPayload(range: RangeKey) {
   )
 
   const activeAccount = accounts.find((account) => account.status === "active") ?? null
-  const activeBucketStats = activeAccount
-    ? bucketStats.filter((row) => row.account_id === activeAccount.id)
-    : []
-  const activeAnalyticsBucketStats = activeAccount
-    ? bucketStats.filter((row) => row.account_id === activeAccount.id)
-    : []
+  const activeAccounts = accounts.filter((account) => account.status === "active")
+  const activeAccountIds = new Set(activeAccounts.map((account) => account.id))
+  const activeBucketStats = bucketStats.filter((row) => activeAccountIds.has(row.account_id))
+  const activeAnalyticsBucketStats = activeBucketStats
   const chartStart =
     range === "all"
       ? earliestDate([
@@ -509,10 +507,9 @@ async function buildAnalyticsPayload(range: RangeKey) {
     return dateKey(date)
   })
 
-  // Build the chart from persisted daily snapshots, selecting the latest
-  // snapshot for each day regardless of which account is active now. Account
-  // activation changes the current projection, but it must not rewrite the
-  // historical chart or make it jump back to an older logical snapshot.
+  // System snapshots aggregate all active accounts at capture time. Legacy
+  // account-scoped rows remain stored, but are not presented as whole-system
+  // history because they only represented one account per day.
   const activeHistoryByDay = new Map<string, ActiveAccountSnapshotRow>()
   for (const row of activeAccountSnapshotRows) {
     const previous = activeHistoryByDay.get(row.captured_day)
@@ -524,8 +521,8 @@ async function buildAnalyticsPayload(range: RangeKey) {
     .sort((a, b) => a.captured_day.localeCompare(b.captured_day))
     .map((row) => ({
       date: row.captured_day,
-      accountId: row.account_id,
-      accountLabel: row.account_label || row.account_email || "Unknown account",
+      accountId: "system",
+      accountLabel: "All active accounts",
       buckets: toNumber(row.buckets),
       storageBytes: toNumber(row.bytes),
       objects: toNumber(row.objects),
@@ -538,9 +535,9 @@ async function buildAnalyticsPayload(range: RangeKey) {
         ? [
             {
               date: generatedAt.slice(0, 10),
-              accountId: activeAccount?.id ?? "active-account",
-              accountLabel: activeAccount?.label || activeAccount?.email || "Active account",
-              buckets: new Set(activeAnalyticsBucketStats.map((row) => row.bucket_name)).size,
+              accountId: "system",
+              accountLabel: "All active accounts",
+              buckets: activeAnalyticsBucketStats.length,
               storageBytes: activeAnalyticsBucketStats.reduce((sum, row) => sum + toNumber(row.bytes), 0),
               objects: activeAnalyticsBucketStats.reduce((sum, row) => sum + toNumber(row.objects), 0),
               capturedAt: generatedAt,
@@ -638,19 +635,19 @@ async function buildAnalyticsPayload(range: RangeKey) {
   // Account totals are the last atomically committed provider snapshot. Keep
   // using them during a refresh; pending bucket rows are work-in-progress and
   // must never replace a committed snapshot with placeholder zeroes.
-  const activeAggregateReady = Boolean(activeAccount?.lastSyncedAt)
+  const activeAggregateReady = activeAccounts.length > 0 && activeAccounts.every((account) => Boolean(account.lastSyncedAt))
   const activeBucketCount = toNumber(sqlSummary.active_bucket_summary.bucket_count)
   const activeBucketObjects = toNumber(sqlSummary.active_bucket_summary.objects)
   const activeBucketBytes = toNumber(sqlSummary.active_bucket_summary.bytes)
-  const totalStorageBytes = activeAccount
-    ? Math.max(0, activeAggregateReady ? toNumber(activeAccount.totalBytes) : activeBucketBytes)
-    : 0
-  const totalObjects = activeAccount
-    ? Math.max(0, activeAggregateReady ? toNumber(activeAccount.totalObjects) : activeBucketObjects)
-    : 0
-  const totalBuckets = activeAccount
-    ? Math.max(0, activeAggregateReady ? toNumber(activeAccount.totalBuckets) : activeBucketCount)
-    : 0
+  const totalStorageBytes = Math.max(0, activeAggregateReady
+    ? activeAccounts.reduce((sum, account) => sum + toNumber(account.totalBytes), 0)
+    : activeBucketBytes)
+  const totalObjects = Math.max(0, activeAggregateReady
+    ? activeAccounts.reduce((sum, account) => sum + toNumber(account.totalObjects), 0)
+    : activeBucketObjects)
+  const totalBuckets = Math.max(0, activeAggregateReady
+    ? activeAccounts.reduce((sum, account) => sum + toNumber(account.totalBuckets), 0)
+    : activeBucketCount)
   const migrationNeedsAttention = (migration: AnalyticsMigration) =>
     migration.status === "failed" ||
     (migration.syncStatus === "error" && migration.status !== "completed" && migration.status !== "canceled")
@@ -731,11 +728,11 @@ async function buildAnalyticsPayload(range: RangeKey) {
     ? Date.parse(sqlSummary.active_bucket_summary.newest_updated_at)
     : Number.NaN
   const activeBucketStatsIncomplete =
-    Boolean(activeAccount) &&
+    activeAccounts.length > 0 &&
     (activeBucketStats.length === 0 || sqlSummary.active_bucket_summary.incomplete)
   const staleBucketStats =
     (activeBucketStatsIncomplete && !activeAggregateReady) ||
-    (Boolean(activeAccount) && activeBucketStats.length > 0 && !Number.isFinite(newestBucketStat))
+    (activeAccounts.length > 0 && activeBucketStats.length > 0 && !Number.isFinite(newestBucketStat))
 
   return {
     range,
