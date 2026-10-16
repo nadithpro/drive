@@ -2274,7 +2274,7 @@ async function workerPayload(db: Client, job: Row) {
   }
 }
 
-async function claimBackendTask(db: Client, agent: Row, migrationId: string, generation: number, instanceId: string) {
+async function claimBackendTask(db: Client, agent: Row, migrationId: string, generation: number, instanceId: string, directQueueMode: boolean) {
   const owner = `${agent.id}:${instanceId}`
   const claimed = await db.query(`with candidate as (
       select s.id,s.migration_id,s.migration_item_id,s.account_id,s.bucket_name,s.prefix,s.cursor,s.last_key,
@@ -2315,12 +2315,12 @@ async function claimBackendTask(db: Client, agent: Row, migrationId: string, gen
         where v.migration_id=$1 and v.generation=$2 and m.status in('running','verifying')
           and (v.status='pending' or (v.status='running' and (v.lease_expires_at is null or v.lease_expires_at<now())))
           and (v.attempt_count=0 or v.updated_at<=now()-make_interval(mins=>least(30,power(2,least(v.attempt_count,5))::int)))
-          and (m.options->>'executionMode' is distinct from 'migration_workers' or (
+          and (m.options->>'executionMode' is distinct from 'migration_workers' or $3::boolean or (
             i.progress->'migrationInventory'->>'status'='completed' and i.progress->'migrationQueue'->>'status'='completed'
             and not exists(select 1 from drive_repair_jobs j where j.migration_id=m.id
               and j.work_key like format('migration:%s:generation:%s:inventory:%%',m.id,$2)
               and j.payload->'itemIds'->>0=i.id::text and j.status<>'completed')))
-        order by v.updated_at for update of v skip locked limit 1`, [migrationId, generation])
+        order by v.updated_at for update of v skip locked limit 1`, [migrationId, generation, directQueueMode])
       const state = verification.rows[0]
       if (!state) {
         await db.query("commit")
@@ -2388,7 +2388,7 @@ async function completeBackendVerification(db: Client, task: Row) {
         select gen_random_uuid(),$1::uuid,$4::uuid,$5::uuid,case when d.key is null then 'missing' else 'size_mismatch' end,s.key,s.size,d.size
         from drive_bucket_scan_objects s left join drive_bucket_scan_objects d on d.scan_id=$5::uuid and d.key=s.key
         where s.scan_id=$4::uuid and not s.is_dir_marker and (
-          d.key is null or ($8::boolean and (d.size<>s.size or
+          d.key is null or (d.size<>s.size or
           (trim(both '"' from coalesce(s.etag,'')) ~ '^[0-9a-fA-F]{32}$' and trim(both '"' from coalesce(d.etag,'')) ~ '^[0-9a-fA-F]{32}$' and trim(both '"' from s.etag)<>trim(both '"' from d.etag)) or
           ($6='migration_workers' and not exists(select 1 from drive_repair_jobs j where j.migration_id=$7::uuid and j.status='completed'
             and j.payload->>'workerGeneration'=$2::text and j.payload->'itemIds'->>0=$1::text
@@ -2398,8 +2398,8 @@ async function completeBackendVerification(db: Client, task: Row) {
             and j.result->'items'->0->'integrityProofs'->0->>'verified'='true'
             and j.result->'items'->0->'integrityProofs'->0->>'sha256' ~ '^[0-9a-f]{64}$'
             and trim(both '"' from coalesce(j.result->'items'->0->'integrityProofs'->0->>'destinationEtag',''))=trim(both '"' from coalesce(d.etag,''))
-          )))
-        )) returning kind
+          ))
+        ) returning kind
       ), extra_diffs as (
         insert into drive_bucket_verify_diffs(id,migration_item_id,source_scan_id,dest_scan_id,kind,key,source_size,dest_size)
         select gen_random_uuid(),$1::uuid,$4::uuid,$5::uuid,'extra',d.key,null,d.size from drive_bucket_scan_objects d
@@ -2413,15 +2413,18 @@ async function completeBackendVerification(db: Client, task: Row) {
           mismatched_objects=c.mismatched,extra_objects=c.extra,attempt_count=0,last_error=null,lease_owner=null,
           lease_expires_at=null,completed_at=now(),updated_at=now()
         from counts c where v.migration_item_id=$1::uuid and v.generation=$2::int and v.lease_owner=$3::text
-        returning c.missing,c.mismatched,c.extra
+        returning c.missing,c.mismatched,c.extra,v.source_objects,v.source_bytes,v.destination_objects,v.destination_bytes
       ), item_done as (
         update drive_migration_items i set last_progress_at=now(),updated_at=now(),progress=jsonb_set(jsonb_set(coalesce(i.progress,'{}'::jsonb),'{fileVerification}',
-          jsonb_build_object('status','completed','missing',(select missing from state_done),'mismatched',(select mismatched from state_done),'extra',(select extra from state_done),'generation',$2::int,'completedAt',now())),
+          jsonb_build_object('status','completed','missing',(select missing from state_done),'mismatched',(select mismatched from state_done),'extra',(select extra from state_done),
+            'sourceObjects',(select source_objects from state_done),'sourceBytes',(select source_bytes from state_done),
+            'destinationObjects',(select destination_objects from state_done),'destinationBytes',(select destination_bytes from state_done),
+            'generation',$2::int,'completedAt',now())),
           '{stage}','"file_verification_completed"'::jsonb,true)
         from state_done where i.id=$1::uuid returning i.id
       ) select * from state_done`,
     [task.migration_item_id, task.generation, task.lease_owner, task.source_scan_id, task.destination_scan_id,
-      task.execution_mode || null, task.migration_id, task.overwrite !== false])
+      task.execution_mode || null, task.migration_id])
     if (!result.rowCount) throw new Error("Backend Worker verification lease was lost")
     await db.query("commit")
     return json({ task: null, verification: { status: "completed", missing: Number(result.rows[0].missing), mismatched: Number(result.rows[0].mismatched), extra: Number(result.rows[0].extra) }, worked: true })
@@ -2546,8 +2549,13 @@ async function persistBackendVerificationPage(db: Client, body: Row, objects: Ro
         update drive_migration_verification_state v set ${cursorColumn}=$8,
           ${objectColumn}=greatest(0,coalesce(v.${objectColumn},0)+d.object_delta),${byteColumn}=greatest(0,coalesce(v.${byteColumn},0)+d.byte_delta),
           phase=$11,status='pending',attempt_count=0,last_error=null,lease_owner=null,lease_expires_at=null,updated_at=now()
-        from delta d,saved_scan s where v.migration_item_id=$2::uuid and v.generation=$4 and v.lease_owner=$5 returning v.migration_item_id
-      ) select exists(select 1 from saved_state) advanced,(select object_delta from delta) object_delta,(select byte_delta from delta) byte_delta`,
+        from delta d,saved_scan s where v.migration_item_id=$2::uuid and v.generation=$4 and v.lease_owner=$5 returning v.migration_item_id,v.phase,v.source_objects,v.source_bytes,v.destination_objects,v.destination_bytes
+      ), saved_item as (
+        update drive_migration_items i set last_progress_at=now(),updated_at=now(),progress=jsonb_set(coalesce(i.progress,'{}'::jsonb),'{fileVerification}',
+          jsonb_build_object('status','running','phase',$6::text,'sourceObjects',v.source_objects,'sourceBytes',v.source_bytes,
+            'destinationObjects',v.destination_objects,'destinationBytes',v.destination_bytes,'generation',$4::int,'updatedAt',now()))
+        from saved_state v where i.id=v.migration_item_id and i.migration_id=$3::uuid returning i.id
+      ) select exists(select 1 from saved_item) advanced,(select object_delta from delta) object_delta,(select byte_delta from delta) byte_delta`,
     [scanId, itemId, migrationId, generation, leaseToken, phase, JSON.stringify(objects), cursor, typeof body.lastKey === "string" ? body.lastKey : objects.at(-1)?.key || null, truncated, nextPhase])
     if (result.rows[0]?.advanced !== true) { await db.query("rollback"); return json({ error: "Backend verification lease expired or was superseded" }, 409) }
     await db.query("commit")
@@ -2639,10 +2647,12 @@ async function workerRequest(request: Request, env: Env, path: string) {
       const current = active.rows[0]
       if (!current || !["running", "verifying"].includes(String(current.status))) return json({ migrationComplete: true, task: null })
       if (Number(current.generation) !== generation) return json({ generationSuperseded: true, task: null }, 409)
+      const queueConfiguration = await db.query(`select value->>'queueDatabaseUrl' queue_url from drive_app_settings where key='migration-workers' limit 1`)
+      const directQueueMode = Boolean(String(queueConfiguration.rows[0]?.queue_url || "").trim())
       await db.query(`update drive_agent_runs set status='running',updated_at=now(),summary='Backend Worker is scanning or verifying migration data'
         where agent_id=$1 and run_type='github_backend_dispatch' and payload->>'workerInstanceId'=$2 and status in('pending','running')`, [agent.id, instanceId])
       await db.query(`update drive_agents set status='online',last_heartbeat_at=now(),last_seen_host='github-actions-backend-worker',updated_at=now(),last_error=null where id=$1 and status<>'disabled'`, [agent.id])
-      return claimBackendTask(db, agent, migrationId, generation, instanceId)
+      return claimBackendTask(db, agent, migrationId, generation, instanceId, directQueueMode)
     }
     if (action === "backend-heartbeat") {
       if (agent.metadata?.workerKind !== "backend" || !Array.isArray(agent.capabilities) || !agent.capabilities.includes("scan") || agent.capabilities.includes("bulk_migrate")) return json({ error: "Worker is not registered for Backend Worker scans" }, 409)
