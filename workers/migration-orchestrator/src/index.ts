@@ -1501,10 +1501,10 @@ async function finishOrRepair(db: Client, migration: Row, generation: number) {
           result=jsonb_set(coalesce(j.result,'{}'::jsonb),'{verificationRetryCount}',to_jsonb(coalesce((j.result->>'verificationRetryCount')::int,0)+1)),updated_at=now()
         where j.migration_id=$1 and j.mode='migration' and j.status='completed'
           and j.payload->'itemIds'->>0=any($2::text[])
-          and j.payload->>'workerGeneration'=$4::text
+          and j.payload->>'workerGeneration'=$4::int::text
           and exists(select 1 from drive_bucket_verify_diffs d join drive_migration_verification_state v on v.migration_item_id=d.migration_item_id
             where d.migration_item_id=any($3::uuid[]) and d.migration_item_id::text=j.payload->'itemIds'->>0
-              and v.generation=$4 and d.kind in('missing','size_mismatch')
+              and v.generation=$4::int and d.kind in('missing','size_mismatch')
               and d.key=j.payload->'inventoryObjects'->0->>'key')`,
       [migration.id, retryIds, retryIds, generation])
       if (!requeued.rowCount) {
