@@ -2342,7 +2342,7 @@ async function claimBackendTask(db: Client, agent: Row, migrationId: string, gen
       }
       if (phase === "compare") {
         await db.query("commit")
-        return completeBackendVerification(db, { ...state, ...leased.rows[0], lease_owner: owner, migration_id: migrationId, execution_mode: state.options?.executionMode, overwrite: state.options?.overwrite !== false })
+        return completeBackendVerification(db, { ...state, ...leased.rows[0], lease_owner: owner, migration_id: migrationId, execution_mode: state.options?.executionMode, direct_queue_mode: directQueueMode, overwrite: state.options?.overwrite !== false })
       }
       const scan = await db.query(`select cursor,last_key from drive_bucket_scans where id=$1 and migration_id=$2 and migration_item_id=$3`, [scanId, migrationId, state.migration_item_id])
       await db.query(`update drive_bucket_scans set lease_owner=$2,lease_expires_at=now()+interval '90 seconds',status='running',updated_at=now() where id=$1`, [scanId, owner])
@@ -2390,7 +2390,7 @@ async function completeBackendVerification(db: Client, task: Row) {
         where s.scan_id=$4::uuid and not s.is_dir_marker and (
           d.key is null or (d.size<>s.size or
           (trim(both '"' from coalesce(s.etag,'')) ~ '^[0-9a-fA-F]{32}$' and trim(both '"' from coalesce(d.etag,'')) ~ '^[0-9a-fA-F]{32}$' and trim(both '"' from s.etag)<>trim(both '"' from d.etag)) or
-          ($6='migration_workers' and not exists(select 1 from drive_repair_jobs j where j.migration_id=$7::uuid and j.status='completed'
+          ($6='migration_workers' and not $8::boolean and not exists(select 1 from drive_repair_jobs j where j.migration_id=$7::uuid and j.status='completed'
             and j.payload->>'workerGeneration'=$2::text and j.payload->'itemIds'->>0=$1::text
             and j.payload->'inventoryObjects'->0->>'key'=s.key
             and trim(both '"' from coalesce(j.payload->'inventoryObjects'->0->>'etag',''))=trim(both '"' from coalesce(s.etag,''))
@@ -2424,7 +2424,7 @@ async function completeBackendVerification(db: Client, task: Row) {
         from state_done where i.id=$1::uuid returning i.id
       ) select * from state_done`,
     [task.migration_item_id, task.generation, task.lease_owner, task.source_scan_id, task.destination_scan_id,
-      task.execution_mode || null, task.migration_id])
+      task.execution_mode || null, task.migration_id, task.direct_queue_mode === true])
     if (!result.rowCount) throw new Error("Backend Worker verification lease was lost")
     await db.query("commit")
     return json({ task: null, verification: { status: "completed", missing: Number(result.rows[0].missing), mismatched: Number(result.rows[0].mismatched), extra: Number(result.rows[0].extra) }, worked: true })
