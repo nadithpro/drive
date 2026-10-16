@@ -32,15 +32,16 @@ jobs:
         run: npm install --omit=dev --ignore-scripts
       - name: Validate worker configuration
         env:
-          SERVER_URL: ${{ secrets.DRIVE_MIGRATION_ORCHESTRATOR_URL }}
-          TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
+          SERVER_URL: ${{ github.event.client_payload.server_url }}
+          TOKEN: ${{ github.event.client_payload.worker_secret }}
         run: |
-          test -n "$SERVER_URL" || { echo "::error::DRIVE_MIGRATION_ORCHESTRATOR_URL is missing"; exit 1; }
-          test -n "$TOKEN" || { echo "::error::DRIVE_WORKER_SHARED_SECRET is missing"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          test -n "$SERVER_URL" || { echo "::error::Dispatch payload is missing the Migration Orchestrator URL"; exit 1; }
+          test -n "$TOKEN" || { echo "::error::Dispatch payload is missing the worker secret"; exit 1; }
       - name: Run Backend Worker
         env:
-          SERVER_URL: ${{ secrets.DRIVE_MIGRATION_ORCHESTRATOR_URL }}
-          TOKEN: ${{ secrets.DRIVE_WORKER_SHARED_SECRET }}
+          SERVER_URL: ${{ github.event.client_payload.server_url }}
+          TOKEN: ${{ github.event.client_payload.worker_secret }}
           AGENT_ID: ${{ github.event.client_payload.agent_id }}
           WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.run_id }}
           DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id }}
