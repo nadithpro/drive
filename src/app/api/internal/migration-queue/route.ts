@@ -171,11 +171,12 @@ async function syncQueue(db: import("pg").Client, migrationId: string, generatio
         'queueWorkerInstanceId',x.worker_instance_id,'currentQueueJobId',x.current_job_id),updated_at=now()
       from jsonb_to_recordset($1::jsonb) as x(worker_instance_id text,agent_id uuid,status text,effective_status text,current_job_id uuid,last_heartbeat_at timestamptz)
       where a.id=x.agent_id`, [records])
-    await queryMain("mirror_queue_workers_to_runs", `update drive_agent_runs r set status=case when x.effective_status='online' then 'running' else 'completed' end,
-      job_reference=coalesce(x.current_job_id::text,r.job_reference),summary=case when x.effective_status='online' then 'Worker heartbeat synchronized from migration queue database' else 'Worker retired or heartbeat expired in migration queue database' end,
-      completed_at=case when x.effective_status='online' then null else coalesce(r.completed_at,x.last_heartbeat_at) end,
-      payload=r.payload||jsonb_build_object('phase',case when x.effective_status='online' then 'working' else 'retired' end,'queueWorkerStatus',x.effective_status,'queueHeartbeatAt',x.last_heartbeat_at),
-      updated_at=now() from jsonb_to_recordset($1::jsonb) as x(worker_instance_id text,agent_id uuid,status text,effective_status text,current_job_id uuid,last_heartbeat_at timestamptz)
+    await queryMain("mirror_queue_workers_to_runs", `update drive_agent_runs r set status='running',
+      job_reference=coalesce(x.current_job_id::text,r.job_reference),summary=case when x.effective_status='online' then 'Worker heartbeat synchronized from migration queue database' else 'Queue heartbeat expired; awaiting GitHub worker shutdown confirmation' end,
+      completed_at=null,
+      payload=r.payload||jsonb_build_object('phase',case when x.effective_status='online' then 'working' else 'heartbeat_expired' end,'queueWorkerStatus',x.effective_status,'queueHeartbeatAt',x.last_heartbeat_at),
+      updated_at=case when x.effective_status='online' then now() else coalesce(x.last_heartbeat_at,r.updated_at) end
+      from jsonb_to_recordset($1::jsonb) as x(worker_instance_id text,agent_id uuid,status text,effective_status text,current_job_id uuid,last_heartbeat_at timestamptz)
       where r.agent_id=x.agent_id and r.payload->>'workerInstanceId'=x.worker_instance_id and r.status in('pending','running')`, [records])
   }
   const aggregate = (await db.query(`select count(*)::bigint total_jobs,

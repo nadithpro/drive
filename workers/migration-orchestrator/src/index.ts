@@ -1777,7 +1777,7 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row, activeQueue
       }
       const remoteStatus = String(remote?.status || "").toLowerCase()
       const remoteStartedAt = Date.parse(String(remote?.run_started_at || remote?.created_at || ""))
-      const rotationDue = ["in_progress", "waiting"].includes(remoteStatus)
+      const rotationDue = remoteStatus === "in_progress"
         && Number.isFinite(remoteStartedAt)
         && Date.now() - remoteStartedAt >= GITHUB_WORKER_MAX_RUNTIME_SECONDS * 1000
       if (remote && rotationDue) {
@@ -1794,6 +1794,14 @@ async function dispatchWorkers(db: Client, env: Env, migration: Row, activeQueue
       // drive_agent_runs. Their queue heartbeat is the source of truth for
       // capacity; the run row only records that GitHub accepted dispatch.
       if (directQueueMode && activeQueueWorkerInstances.includes(instanceId)) {
+        agentOccupancy += 1
+        continue
+      }
+      // A queued/waiting workflow has not started a worker process and cannot
+      // heartbeat yet. Keep its slot reserved until GitHub starts or cancels
+      // it; treating queue wait time as a stale worker repeatedly canceled
+      // valid dispatches and serialized slow cancel/check calls in every cycle.
+      if (remote && ["queued", "waiting", "requested", "pending"].includes(remoteStatus)) {
         agentOccupancy += 1
         continue
       }
