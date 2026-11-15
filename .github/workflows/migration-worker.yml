@@ -2,10 +2,12 @@ name: Migration Worker
 run-name: >-
   Migration Worker / ${{
     github.event.client_payload.agent_id ||
+    inputs.agent_id ||
     github.run_id
   }} / ${{
     github.event.client_payload.repair_job_id ||
     github.event.client_payload.worker_instance_id ||
+    inputs.worker_instance_id ||
     github.run_id
   }}
 
@@ -13,17 +15,28 @@ permissions:
   contents: read
 
 concurrency:
-  group: drive-migration-worker-${{ github.event.client_payload.worker_instance_id || github.run_id }}
+  group: drive-migration-worker-${{ github.event.client_payload.worker_instance_id || inputs.worker_instance_id || github.run_id }}
   cancel-in-progress: true
 
 on:
   repository_dispatch:
     types: [drive-migration-worker]
+  workflow_dispatch:
+    inputs:
+      migration_id: { description: Migration ID, required: true, type: string }
+      worker_generation: { description: Worker generation, required: true, type: string }
+      agent_id: { description: Registered worker agent ID, required: true, type: string }
+      worker_instance_id: { description: Durable worker instance ID, required: true, type: string }
+      server_url: { description: Migration Orchestrator URL, required: true, type: string }
+      worker_secret: { description: Runtime worker authentication secret, required: true, type: string }
+      workflow_file: { description: Expected worker workflow path, required: true, type: string }
+      code_ref: { description: Worker code reference, required: true, type: string }
+      max_runtime_seconds: { description: Maximum worker runtime, required: true, type: string }
 
 jobs:
   run-migration-worker:
-    if: contains(github.workflow_ref, github.event.client_payload.workflow_file)
-    name: Run ${{ github.run_number }} / Worker ${{ github.event.client_payload.worker_instance_id || github.run_id }}
+    if: contains(github.workflow_ref, inputs.workflow_file || github.event.client_payload.workflow_file)
+    name: Run ${{ github.run_number }} / Worker ${{ inputs.worker_instance_id || github.event.client_payload.worker_instance_id || github.run_id }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     defaults:
@@ -33,7 +46,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.client_payload.code_ref || github.sha }}
+          ref: ${{ inputs.code_ref || github.event.client_payload.code_ref || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -47,8 +60,8 @@ jobs:
 
       - name: Validate worker configuration
         env:
-          SERVER_URL: ${{ github.event.client_payload.server_url }}
-          TOKEN: ${{ github.event.client_payload.worker_secret }}
+          SERVER_URL: ${{ inputs.server_url || github.event.client_payload.server_url }}
+          TOKEN: ${{ inputs.worker_secret || github.event.client_payload.worker_secret }}
         run: |
           echo "::add-mask::$TOKEN"
           test -n "$SERVER_URL" || { echo "::error::Dispatch payload is missing the Migration Orchestrator URL"; exit 1; }
@@ -56,13 +69,13 @@ jobs:
 
       - name: Run migration worker
         env:
-          SERVER_URL: ${{ github.event.client_payload.server_url }}
-          AGENT_ID: ${{ github.event.client_payload.agent_id }}
-          WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.run_id }}
-          DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id }}
-          DRIVE_WORKER_GENERATION: ${{ github.event.client_payload.worker_generation || '' }}
+          SERVER_URL: ${{ inputs.server_url || github.event.client_payload.server_url }}
+          AGENT_ID: ${{ inputs.agent_id || github.event.client_payload.agent_id }}
+          WORKER_INSTANCE_ID: ${{ inputs.worker_instance_id || github.event.client_payload.worker_instance_id || github.run_id }}
+          DRIVE_MIGRATION_ID: ${{ inputs.migration_id || github.event.client_payload.migration_id }}
+          DRIVE_WORKER_GENERATION: ${{ inputs.worker_generation || github.event.client_payload.worker_generation || '' }}
           DRIVE_REPAIR_JOB_ID: ${{ github.event.client_payload.repair_job_id || '' }}
-          TOKEN: ${{ github.event.client_payload.worker_secret }}
+          TOKEN: ${{ inputs.worker_secret || github.event.client_payload.worker_secret }}
           EXIT_AFTER_JOB: ${{ github.event.client_payload.repair_job_id && 'true' || 'false' }}
-          MAX_RUNTIME_SECONDS: ${{ github.event.client_payload.max_runtime_seconds || '21300' }}
+          MAX_RUNTIME_SECONDS: ${{ inputs.max_runtime_seconds || github.event.client_payload.max_runtime_seconds || '21300' }}
         run: npm start
