@@ -1,21 +1,59 @@
 name: Drive Backend Worker
 run-name: >-
-  Backend Worker / ${{ github.event.client_payload.agent_id || github.run_id }} / ${{ github.event.client_payload.worker_instance_id || github.run_id }}
+  Backend Worker / ${{ github.event.client_payload.agent_id || github.event.inputs.agent_id || github.run_id }} / ${{ github.event.client_payload.worker_instance_id || github.event.inputs.worker_instance_id || github.run_id }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: drive-backend-worker-${{ github.event.client_payload.worker_instance_id || github.run_id }}
+  group: drive-backend-worker-${{ github.event.client_payload.worker_instance_id || github.event.inputs.worker_instance_id || github.run_id }}
   cancel-in-progress: true
 
 on:
+  workflow_dispatch:
+    inputs:
+      migration_id:
+        description: Migration to scan or verify
+        required: true
+        type: string
+      worker_generation:
+        description: Migration worker generation
+        required: true
+        type: string
+      agent_id:
+        description: Registered backend worker id
+        required: true
+        type: string
+      worker_instance_id:
+        description: Durable backend worker instance id
+        required: true
+        type: string
+      server_url:
+        description: Migration Orchestrator URL
+        required: true
+        type: string
+      worker_secret:
+        description: Worker authentication secret
+        required: true
+        type: string
+      workflow_file:
+        description: Registered workflow path
+        required: true
+        type: string
+      code_ref:
+        description: Worker code commit
+        required: true
+        type: string
+      max_runtime_seconds:
+        description: Maximum worker runtime
+        required: true
+        type: string
   repository_dispatch:
     types: [drive-backend-worker]
 
 jobs:
   run-backend-worker:
-    if: contains(github.workflow_ref, github.event.client_payload.workflow_file)
+    if: contains(github.workflow_ref, github.event.client_payload.workflow_file || github.event.inputs.workflow_file)
     runs-on: ubuntu-latest
     timeout-minutes: 360
     defaults:
@@ -24,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.client_payload.code_ref || github.sha }}
+          ref: ${{ github.event.client_payload.code_ref || github.event.inputs.code_ref || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -32,19 +70,19 @@ jobs:
         run: npm install --omit=dev --ignore-scripts
       - name: Validate worker configuration
         env:
-          SERVER_URL: ${{ github.event.client_payload.server_url }}
-          TOKEN: ${{ github.event.client_payload.worker_secret }}
+          SERVER_URL: ${{ github.event.client_payload.server_url || github.event.inputs.server_url }}
+          TOKEN: ${{ github.event.client_payload.worker_secret || github.event.inputs.worker_secret }}
         run: |
           echo "::add-mask::$TOKEN"
           test -n "$SERVER_URL" || { echo "::error::Dispatch payload is missing the Migration Orchestrator URL"; exit 1; }
           test -n "$TOKEN" || { echo "::error::Dispatch payload is missing the worker secret"; exit 1; }
       - name: Run Backend Worker
         env:
-          SERVER_URL: ${{ github.event.client_payload.server_url }}
-          TOKEN: ${{ github.event.client_payload.worker_secret }}
-          AGENT_ID: ${{ github.event.client_payload.agent_id }}
-          WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.run_id }}
-          DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id }}
-          DRIVE_WORKER_GENERATION: ${{ github.event.client_payload.worker_generation || '' }}
-          MAX_RUNTIME_SECONDS: ${{ github.event.client_payload.max_runtime_seconds || '21300' }}
+          SERVER_URL: ${{ github.event.client_payload.server_url || github.event.inputs.server_url }}
+          TOKEN: ${{ github.event.client_payload.worker_secret || github.event.inputs.worker_secret }}
+          AGENT_ID: ${{ github.event.client_payload.agent_id || github.event.inputs.agent_id }}
+          WORKER_INSTANCE_ID: ${{ github.event.client_payload.worker_instance_id || github.event.inputs.worker_instance_id || github.run_id }}
+          DRIVE_MIGRATION_ID: ${{ github.event.client_payload.migration_id || github.event.inputs.migration_id }}
+          DRIVE_WORKER_GENERATION: ${{ github.event.client_payload.worker_generation || github.event.inputs.worker_generation || '' }}
+          MAX_RUNTIME_SECONDS: ${{ github.event.client_payload.max_runtime_seconds || github.event.inputs.max_runtime_seconds || '21300' }}
         run: npm start
