@@ -95,9 +95,19 @@ async function runTask(task) {
 await post(`/workers/${encodeURIComponent(agentId)}/bootstrap`, { workerType: "backend", migrationId, generation })
 let failed = false
 let idleClaims = 0
+let transientClaimFailures = 0
 try {
   while (Date.now() < deadline) {
-    const claimed = await post(`/workers/${encodeURIComponent(agentId)}/backend-claim`, {})
+    let claimed
+    try {
+      claimed = await post(`/workers/${encodeURIComponent(agentId)}/backend-claim`, {})
+      transientClaimFailures = 0
+    } catch (error) {
+      if (error?.status !== 503 || ++transientClaimFailures > 12) throw error
+      const backoffMs = Math.min(15_000, 500 * (2 ** (transientClaimFailures - 1)))
+      await new Promise((resolve) => setTimeout(resolve, backoffMs + Math.floor(Math.random() * 500)))
+      continue
+    }
     if (claimed.migrationComplete || claimed.generationSuperseded) break
     if (!claimed.task) {
       idleClaims += 1
